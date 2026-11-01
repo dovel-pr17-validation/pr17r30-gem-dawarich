@@ -1,0 +1,430 @@
+# frozen_string_literal: true
+
+require 'rails_helper'
+
+RSpec.describe Place, type: :model do
+  describe 'associations' do
+    it { is_expected.to belong_to(:user) }
+    it { is_expected.to have_many(:visits).dependent(:nullify) }
+    it { is_expected.to have_many(:place_visits).dependent(:destroy) }
+    it { is_expected.to have_many(:suggested_visits).through(:place_visits) }
+  end
+
+  describe 'user ownership' do
+    it 'refuses to save a place without a user' do
+      place = build(:place, user: nil)
+
+      expect(place).not_to be_valid
+      expect(place.errors[:user]).to be_present
+    end
+
+    it 'rejects a NULL user_id at the database level' do
+      place = create(:place, user: create(:user))
+
+      expect { place.update_columns(user_id: nil) }
+        .to raise_error(ActiveRecord::NotNullViolation)
+    end
+  end
+
+  describe '.linked_to_confirmed_visits' do
+    it 'excludes places linked only through tombstoned visits' do
+      user = create(:user)
+      alive_place = create(:place, user: user)
+      ghost_place = create(:place, user: user)
+      create(:visit, user: user, place: alive_place, status: 'confirmed')
+      create(:visit, user: user, place: ghost_place, status: 'confirmed', deleted_at: 1.day.ago)
+
+      expect(Place.linked_to_confirmed_visits(user)).to include(alive_place)
+      expect(Place.linked_to_confirmed_visits(user)).not_to include(ghost_place)
+    end
+  end
+
+  describe 'destroying a place' do
+    it 'nullifies place_id on associated visits, does not delete them' do
+      user = create(:user)
+      place = create(:place, user: user)
+      visit = create(:visit, user: user, place: place)
+
+      place.destroy!
+
+      expect(Visit.exists?(visit.id)).to be(true)
+      expect(visit.reload.place_id).to be_nil
+    end
+  end
+
+  describe 'validations' do
+    it { is_expected.to validate_presence_of(:name) }
+    it { is_expected.to validate_presence_of(:lonlat) }
+    it { is_expected.to validate_length_of(:name).is_at_most(255) }
+    it { is_expected.to validate_numericality_of(:visit_radius).only_integer.is_greater_than(0) }
+    it { is_expected.to validate_numericality_of(:visit_radius).is_less_than_or_equal_to(Place::MAX_VISIT_RADIUS) }
+
+    it 'defaults the visit radius to 50 meters' do
+      expect(create(:place).reload.visit_radius).to eq(50)
+    end
+
+    it 'rejects a non-positive visit radius at the database level' do
+      place = create(:place)
+
+      expect { place.update_columns(visit_radius: 0) }
+        .to raise_error(ActiveRecord::StatementInvalid)
+    end
+  end
+
+  describe 'enums' do
+    it { is_expected.to define_enum_for(:source).with_values(%i[manual photon gpx_waypoint]) }
+  end
+
+  describe 'scopes' do
+    let(:user1) { create(:user) }
+    let(:user2) { create(:user) }
+    let!(:place1) { create(:place, user: user1, name: 'Zoo') }
+    let!(:place2) { create(:place, user: user1, name: 'Airport') }
+    let!(:place3) { create(:place, user: user2, name: 'Museum') }
+
+    describe '.for_user' do
+      it 'returns places for the specified user' do
+        expect(Place.for_user(user1)).to contain_exactly(place1, place2)
+      end
+
+      it 'does not return places for other users' do
+        expect(Place.for_user(user1)).not_to include(place3)
+      end
+
+      it 'returns empty when user has no places' do
+        new_user = create(:user)
+        expect(Place.for_user(new_user)).to be_empty
+      end
+    end
+
+    describe '.ordered' do
+      it 'orders places by name alphabetically' do
+        expect(Place.for_user(user1).ordered).to eq([place2, place1])
+      end
+
+      it 'handles case-insensitive ordering' do
+        create(:place, user: user1, name: 'airport')
+        create(:place, user: user1, name: 'BEACH')
+
+        ordered = Place.for_user(user1).ordered
+        # The ordered scope orders by name alphabetically (case-sensitive in most DBs)
+        expect(ordered.map(&:name)).to include('airport', 'BEACH')
+      end
+    end
+
+    describe '.confirmed_for and .unconfirmed_for' do
+      let!(:suggested_only) { create(:place, user: user1, source: :photon, name: 'Suggested Only') }
+
+      it 'keeps a suggestion-only Place unconfirmed' do
+        create(:visit, user: user1, place: suggested_only, status: :suggested)
+
+        expect(Place.confirmed_for(user1)).not_to include(suggested_only)
+        expect(Place.unconfirmed_for(user1)).to include(suggested_only)
+      end
+
+      it 'treats legacy text notes as confirmation' do
+        suggested_only.update!(note: 'Known location')
+
+        expect(Place.confirmed_for(user1)).to include(suggested_only)
+        expect(Place.unconfirmed_for(user1)).not_to include(suggested_only)
+      end
+
+      it 'treats attached timeline notes as confirmation' do
+        create(:note, user: user1, attachable: suggested_only)
+
+        expect(Place.confirmed_for(user1)).to include(suggested_only)
+        expect(Place.map_visible(user1)).to include(suggested_only)
+      end
+    end
+  end
+
+  describe 'Taggable concern integration' do
+    let(:user) { create(:user) }
+    let(:place) { create(:place, user: user) }
+    let(:tag1) { create(:tag, user: user, name: 'Restaurant') }
+    let(:tag2) { create(:tag, user: user, name: 'Favorite') }
+
+    it 'can add tags to a place' do
+      place.add_tag(tag1)
+      expect(place.tags).to include(tag1)
+    end
+
+    it 'can remove tags from a place' do
+      place.tags << tag1
+      place.remove_tag(tag1)
+      expect(place.tags).not_to include(tag1)
+    end
+
+    it 'returns tag names' do
+      place.tags << [tag1, tag2]
+      expect(place.tag_names).to contain_exactly('Restaurant', 'Favorite')
+    end
+
+    it 'checks if tagged with a specific tag' do
+      place.tags << tag1
+      expect(place.tagged_with?(tag1)).to be true
+      expect(place.tagged_with?(tag2)).to be false
+    end
+
+    describe 'scopes' do
+      let!(:tagged_place) { create(:place, user: user) }
+      let!(:untagged_place) { create(:place, user: user) }
+
+      before do
+        tagged_place.tags << tag1
+      end
+
+      it 'filters places with specific tags' do
+        results = Place.with_tags([tag1.id])
+        expect(results).to include(tagged_place)
+        expect(results).not_to include(untagged_place)
+      end
+
+      it 'filters places without tags' do
+        results = Place.without_tags
+        expect(results).to include(untagged_place)
+        expect(results).not_to include(tagged_place)
+      end
+
+      it 'filters places by tag name and user' do
+        results = Place.tagged_with('Restaurant', user)
+        expect(results).to include(tagged_place)
+        expect(results).not_to include(untagged_place)
+      end
+    end
+  end
+
+  describe 'methods' do
+    let(:place) { create(:place, :with_geodata) }
+
+    describe '#address_line' do
+      it 'formats a Photon-shaped address' do
+        place = build(:place, geodata: { 'properties' => { 'street' => 'Poststraße', 'housenumber' => '23',
+                                                           'postcode' => '04275', 'city' => 'Leipzig' } })
+
+        expect(place.address_line).to eq('Poststraße 23, 04275 Leipzig')
+      end
+
+      it 'formats a Nominatim-shaped address' do
+        place = build(:place, geodata: { 'lat' => '51.3', 'lon' => '12.3',
+                                         'address' => { 'road' => 'Poststraße', 'house_number' => '23',
+                                                        'postcode' => '04275', 'city' => 'Leipzig' } })
+
+        expect(place.address_line).to eq('Poststraße 23, 04275 Leipzig')
+      end
+
+      it 'is nil without geodata' do
+        expect(build(:place, geodata: {}).address_line).to be_nil
+        expect(build(:place, geodata: nil).address_line).to be_nil
+      end
+    end
+
+    describe '#osm_id' do
+      it 'returns the osm_id' do
+        expect(place.osm_id).to eq(5_762_449_774)
+      end
+    end
+
+    describe '#osm_key' do
+      it 'returns the osm_key' do
+        expect(place.osm_key).to eq('amenity')
+      end
+    end
+
+    describe '#osm_value' do
+      it 'returns the osm_value' do
+        expect(place.osm_value).to eq('restaurant')
+      end
+    end
+
+    describe '#osm_type' do
+      it 'returns the osm_type' do
+        expect(place.osm_type).to eq('N')
+      end
+    end
+
+    describe '#lon' do
+      it 'returns the longitude' do
+        expect(place.lon).to be_within(0.000001).of(13.0948638)
+      end
+
+      context 'when a legacy place has no lonlat' do
+        it 'returns the longitude column as a Float' do
+          place.update_column(:lonlat, nil)
+
+          expect(place.reload.lon).to be_a(Float)
+          expect(place.reload.lon).to be_within(0.000001).of(13.0948638)
+        end
+      end
+    end
+
+    describe '#lat' do
+      it 'returns the latitude' do
+        expect(place.lat).to be_within(0.000001).of(54.2905245)
+      end
+
+      context 'when a legacy place has no lonlat' do
+        it 'returns the latitude column as a Float' do
+          place.update_column(:lonlat, nil)
+
+          expect(place.reload.lat).to be_a(Float)
+          expect(place.reload.lat).to be_within(0.000001).of(54.2905245)
+        end
+      end
+    end
+  end
+
+  describe 'name locking' do
+    let(:place) { create(:place, name: Place::DEFAULT_NAME) }
+
+    it 'is unlocked when created' do
+      expect(place.name_locked?).to be(false)
+    end
+
+    it 'locks the name when it is renamed' do
+      expect { place.update!(name: "Mum's house") }
+        .to change { place.reload.name_locked? }.from(false).to(true)
+    end
+
+    it 'does not lock when another attribute changes' do
+      place.update!(city: 'Leipzig')
+
+      expect(place.reload.name_locked?).to be(false)
+    end
+
+    it 'does not lock a machine-named place' do
+      machine_place = build(:place, name: 'Photon Suggestion')
+      machine_place.machine_named = true
+      machine_place.save!
+
+      expect(machine_place.reload.name_locked?).to be(false)
+    end
+
+    it 'does not lock a place minted by detection' do
+      expect(create(:place, name: 'Photon Suggestion').name_locked?).to be(false)
+    end
+
+    it 'locks a place created with a user-supplied name' do
+      user_place = build(:place, name: "Mum's house")
+      user_place.user_named = true
+      user_place.save!
+
+      expect(user_place.reload.name_locked?).to be(true)
+    end
+
+    it 'clears the lock when the name is reset to the default' do
+      place.update!(name: "Mum's house")
+
+      expect { place.update!(name: Place::DEFAULT_NAME) }
+        .to change { place.reload.name_locked? }.from(true).to(false)
+    end
+
+    it 'keeps an existing lock when a machine write touches other attributes' do
+      place.update!(name: "Mum's house")
+      locked_at = place.reload.name_locked_at
+
+      place.machine_named = true
+      place.update!(city: 'Leipzig')
+
+      expect(place.reload.name_locked_at).to be_within(1.second).of(locked_at)
+    end
+  end
+
+  describe 'renaming' do
+    let(:place) { create(:place, name: 'Imaginary Lane 42') }
+
+    it 'carries the new name to visits still showing the old place name' do
+      visit = create(:visit, user: place.user, place: place, name: 'Imaginary Lane 42')
+
+      place.update!(name: 'Synthetic Home')
+
+      expect(visit.reload).to have_attributes(name: nil, display_name: 'Synthetic Home')
+    end
+
+    it 'carries the new name to visits still showing the default name' do
+      visit = create(:visit, user: place.user, place: place, name: Place::DEFAULT_NAME)
+
+      place.update!(name: 'Synthetic Home')
+
+      expect(visit.reload).to have_attributes(name: nil, display_name: 'Synthetic Home')
+    end
+
+    it 'leaves a visit the user named independently alone' do
+      visit = create(:visit, user: place.user, place: place, name: 'Dentist')
+
+      place.update!(name: 'Synthetic Home')
+
+      expect(visit.reload.name).to eq('Dentist')
+    end
+
+    it 'leaves default-named visits alone when only other attributes change' do
+      visit = create(:visit, user: place.user, place: place, name: Place::DEFAULT_NAME)
+
+      place.update!(city: 'Leipzig')
+
+      expect(visit.reload.name).to eq(Place::DEFAULT_NAME)
+    end
+
+    it 'leaves visits of other places alone' do
+      other = create(:visit, user: place.user, place: create(:place, user: place.user), name: 'Imaginary Lane 42')
+
+      place.update!(name: 'Synthetic Home')
+
+      expect(other.reload.name).to eq('Imaginary Lane 42')
+    end
+  end
+
+  describe 'archiving', :archive do
+    include ActiveSupport::Testing::TimeHelpers
+
+    let(:user) { create(:user) }
+    let(:place) { create(:place, user:, source: :photon) }
+
+    it 'casts the archived boolean and keeps the original archive time on repeated writes' do
+      travel_to Time.zone.parse('2026-10-27 12:00:00') do
+        place.update!(archived: '1')
+        expect(place.reload).to be_archived
+        expect(place.archived_at).to eq(Time.current)
+        travel 1.hour
+        expect { place.update!(archived: true) }.not_to(change { place.reload.archived_at })
+        place.update!(archived: '0')
+        expect(place.reload).not_to be_archived
+        expect(place.archived_at).to be_nil
+      end
+    end
+
+    it 'separates archived and non-archived scopes within the user' do
+      active = create(:place, user:)
+      place.update!(archived: true)
+      create(:place, archived: true)
+
+      expect(user.places.archived).to contain_exactly(place)
+      expect(user.places.not_archived).to contain_exactly(active)
+    end
+
+    it 'keeps an archived discovered Place confirmed but hidden from the map' do
+      place.update!(archived: true)
+
+      expect(user.places.confirmed_for(user)).to include(place)
+      expect(user.places.unconfirmed_for(user)).not_to include(place)
+      expect(user.places.map_visible(user)).not_to include(place)
+    end
+
+    it 'enqueues reattribution on archive and unarchive but not an unchanged archive state' do
+      expect { place.update!(archived: true) }
+        .to have_enqueued_job(Places::ReattributeSuggestedVisitsJob).with(user.id, place.id).once
+      expect { place.update!(archived: true) }.not_to have_enqueued_job(Places::ReattributeSuggestedVisitsJob)
+      expect { place.update!(archived: false) }
+        .to have_enqueued_job(Places::ReattributeSuggestedVisitsJob).with(user.id, place.id).once
+    end
+
+    it 'ignores archived Places at the shared attribution entry point' do
+      place.update!(archived: true, visit_radius: 25)
+      active = create(:place, user:, latitude: place.lat, longitude: place.lon, visit_radius: 100)
+
+      expect(user.places.attribution_for(place.lat, place.lon)).to eq(active)
+      active.update!(archived: true)
+      expect(user.places.attribution_for(place.lat, place.lon)).to be_nil
+    end
+  end
+end

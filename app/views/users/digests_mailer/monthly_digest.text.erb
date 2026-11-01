@@ -1,0 +1,55 @@
+<%= t('.month_year_in_review', month: l(Date.new(@digest.year, @digest.month, 1), format: :month_name), year: @digest.year) %>
+─────────────────────────
+
+<%= t('.here_s_what_your_location_history_looked_like_last_month') %>
+
+<%= t('.overview') %>
+  <%= t('.distance') %>       <%= distance_with_unit(@digest.distance, @distance_unit) %>
+<% if @digest.flight_distance.positive? %>
+  <%= "#{t('.flights')} ".ljust(15) %><%= distance_with_unit(@digest.flight_distance, @distance_unit) %>
+<% end %>
+  <%= t('.active_days') %>    <%= @active_days %>
+  <%= t('.countries') %>      <%= @digest.time_spent_by_location.to_h['countries'].to_a.size %>
+  <%= t('.cities') %>         <%= @digest.time_spent_by_location.to_h['cities'].to_a.size %>
+
+<%= t('.weekly_pattern') %>
+<%= ascii_hbar(
+  week_ordered(@weekday_totals),
+  labels: week_ordered(I18n.t('date.abbr_day_names').rotate),
+  width: 20,
+  suffix: " #{@distance_unit}"
+) %>
+
+<%= t('.daily_distance') %>
+<%= ascii_sparkline(
+  (1..31).map { |d| @daily_distances[d.to_s].to_f }
+         .reject(&:zero?)
+         .presence || [0]
+) %>
+
+<% if @top_countries.any? %>
+<%= t('.top_countries') %>
+<%= ascii_ranked_list(@top_countries, value_key: 'minutes', label_key: 'name', width: 20, format: ->(m) { "#{(m.to_f / 60).round}h" }) %>
+
+<% end %>
+<% if @top_cities.any? %>
+<%= t('.top_cities') %>
+<%= ascii_ranked_list(@top_cities.first(5), value_key: 'minutes', label_key: 'name', width: 20, format: ->(m) { "#{(m.to_f / 60).round}h" }) %>
+
+<% end %>
+<% if @first_countries.any? || @first_cities.any? %>
+<%= t('.first_visits_this_month') %>
+<% @first_countries.first(2).each do |country| %><%= t('.new_country_line', country: country) %>
+<% end %><% @first_cities.first(3 - @first_countries.first(2).size).each do |city| %><%= t('.new_city_line', city: city) %>
+<% end %>
+<% end %>
+<% if @digest.year_over_year.to_h['distance_change_percent'].present? %>
+<%= t('.vs_previous_month') %>
+  <%= t('.distance') %>  <%= ascii_trend_from_pct(@digest.distance, @digest.year_over_year['distance_change_percent']) %>
+
+<% end %>
+<%= t('.view_full_insights') %> <%= insights_url(**digest_utm(campaign: 'monthly_digest', content: 'view_insights')) %>
+
+─────────────────────────────────────────
+<%= t('.you_re_receiving_this_because_monthly_digest_emails_are_on_3') %>
+<%= t('.manage_email_preferences_2') %> <%= settings_general_index_url(anchor: 'email-digests', **digest_utm(campaign: 'monthly_digest', content: 'manage_preferences')) %>

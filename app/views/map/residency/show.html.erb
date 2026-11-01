@@ -1,0 +1,17 @@
+<%= turbo_frame_tag "residency-content" do %>
+  <%= render 'insights/year_calendar', year: @year, activity: @activity,
+                                       daily_countries: @daily_countries, countries: @countries %>
+  <% if @countries.any? && @distance_race %>
+    <div class="mb-6 grid gap-6 lg:grid-cols-2 [&>section]:mb-0" data-testid="insights-distance-row">
+      <%= render 'insights/country_ribbon', year: @year, countries: @countries, total_tracked_days: @total_tracked_days %>
+      <%= render 'insights/distance_race', race: @distance_race %>
+    </div>
+  <% elsif @countries.any? %>
+    <%= render 'insights/country_ribbon', year: @year, countries: @countries, total_tracked_days: @total_tracked_days %>
+  <% elsif @distance_race %>
+    <%= render 'insights/distance_race', race: @distance_race %>
+  <% end %>
+  <% if @countries.empty? %>
+    <p class="mb-6 text-sm text-base-content/60" data-testid="residency-no-countries"><%= t('.points_need_reverse_geocoding_to_detect_countries') %></p>
+  <% end %>
+<% end %>

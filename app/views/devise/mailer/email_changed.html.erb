@@ -1,0 +1,7 @@
+<p><%= t('.hello') %> <%= @email %>!</p>
+
+<% if @resource.try(:unconfirmed_email?) %>
+  <p><%= t('.we_re_contacting_you_to_notify_you_that_your_email') %> <%= @resource.unconfirmed_email %>.</p>
+<% else %>
+  <p><%= t('.we_re_contacting_you_to_notify_you_that_your_email_2') %> <%= @resource.email %>.</p>
+<% end %>

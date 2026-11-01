@@ -1,0 +1,75 @@
+# OneDev build spec.
+#
+# Build Image: runs automatically on dev; run it manually for any other branch
+# or commit (Run job on the branch page). Tag: dawarich:<commit>.
+# Build Production Image: runs on every update of master. Tags: dawarich:<commit>
+# and the moving dawarich:production. Deploys pin the digest, not the tag.
+#
+# The Dockerfile runs `npm ci` itself, so no host-side npm step is needed.
+
+version: 47
+jobs:
+- name: Build Image
+  steps:
+  - type: CheckoutStep
+    name: checkout
+    cloneCredential:
+      type: DefaultCredential
+    withLfs: false
+    withSubmodules: false
+    condition: SUCCESSFUL
+    optional: false
+  - type: BuildImageStep
+    name: build and push to built-in registry
+    dockerfile: docker/Dockerfile
+    registryLogins:
+    - registryUrl: '@server_url@'
+      userName: '@job_token@'
+      passwordSecret: onedev-registry-token
+    output:
+      type: RegistryOutput
+      tags: '@server@/@project_path@/dawarich:@commit_hash@'
+    platforms: linux/amd64
+    condition: SUCCESSFUL
+    optional: false
+  triggers:
+  - type: BranchUpdateTrigger
+    branches: dev
+    userMatch: anyone
+  retryCondition: never
+  maxRetries: 3
+  retryDelay: 30
+  timeout: 7200
+- name: Build Production Image
+  steps:
+  - type: CheckoutStep
+    name: checkout
+    cloneCredential:
+      type: DefaultCredential
+    withLfs: false
+    withSubmodules: false
+    condition: SUCCESSFUL
+    optional: false
+  - type: BuildImageStep
+    name: build and push production image
+    dockerfile: docker/Dockerfile
+    registryLogins:
+    - registryUrl: '@server_url@'
+      userName: '@job_token@'
+      passwordSecret: onedev-registry-token
+    output:
+      type: RegistryOutput
+      # Multiple tags MUST be space-separated (a newline becomes part of the tag).
+      tags: '@server@/@project_path@/dawarich:@commit_hash@ @server@/@project_path@/dawarich:production'
+    platforms: linux/amd64
+    condition: SUCCESSFUL
+    optional: false
+  triggers:
+  - type: BranchUpdateTrigger
+    branches: master
+    userMatch: anyone
+  sequentialGroup: '@project_path@:production'
+  retryCondition: never
+  maxRetries: 3
+  retryDelay: 30
+  timeout: 7200

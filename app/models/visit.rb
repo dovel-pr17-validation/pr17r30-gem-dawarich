@@ -1,0 +1,199 @@
+# frozen_string_literal: true
+
+class Visit < ApplicationRecord
+  DEFAULT_NAME = 'Unknown Location'
+
+  include Demoable
+  include Notable
+
+  belongs_to :area, optional: true
+  belongs_to :place, optional: true
+  belongs_to :user
+  has_many :points, dependent: :nullify
+  has_many :place_visits, dependent: :destroy
+  has_many :suggested_places, through: :place_visits, source: :place
+
+  after_commit :cleanup_old_place_if_orphan, on: :update
+  after_commit :propagate_adoption_to_dependents, on: %i[create update]
+  # Soft deletion never fires destroy callbacks, so tombstoning must trigger
+  # the same orphan-place check or auto-created photon places leak forever;
+  # declining hides the visit the same way, so it re-evaluates the place too.
+  # One combined callback: registering the same method for separate
+  # after_*_commit hooks would silently keep only the last registration.
+  after_commit :cleanup_place_if_orphan, on: %i[update destroy], if: :left_active_state?
+  after_commit :bust_timeline_month_summary_cache, unless: -> { demo? && previously_new_record? }
+
+  validates :started_at, :ended_at, :duration, :status, presence: true
+
+  validates :ended_at, comparison: { greater_than: :started_at }
+  validates :confidence, numericality: { only_integer: true, in: 0..100 }, allow_nil: true
+
+  enum :status, { suggested: 0, confirmed: 1, declined: 2 }
+
+  # Visible visits. Soft-deleted rows and legacy declines are tombstones:
+  # hidden everywhere, but treated as fixed anchors by
+  # Visits::Detection::Persister so the detector never resurrects a visit
+  # the user removed.
+  scope :active, -> { where(deleted_at: nil).where.not(status: :declined) }
+  # Visits with time inside from..to. One that ends exactly at `from` belongs
+  # to the time before it, as in Timeline::TrackDayShares.
+  scope :overlapping, lambda { |from, to|
+    where('visits.started_at <= :to AND (visits.ended_at > :from OR visits.started_at >= :from)', from:, to:)
+  }
+  # Rows the detector may regenerate wholesale. Everything else — confirmed,
+  # declined, tombstoned, imported, demo-seeded, or annotated with a note —
+  # is user-owned and anchors re-detection.
+  scope :machine_detected, lambda {
+    active.where(status: :suggested, import_id: nil, demo: false)
+          .where.not(id: Note.where(attachable_type: 'Visit').select(:attachable_id))
+  }
+
+  POINT_WEIGHT_SQL = '1.0 / GREATEST(COALESCE(points.accuracy, ' \
+                     "#{Visits::Detection::StayAssembler::DEFAULT_ACCURACY_M}), 1)".freeze
+  CENTER_LATITUDE_SQL = "SUM(ST_Y(points.lonlat::geometry) * #{POINT_WEIGHT_SQL}) / SUM(#{POINT_WEIGHT_SQL})".freeze
+  CENTER_LONGITUDE_SQL = "SUM(ST_X(points.lonlat::geometry) * #{POINT_WEIGHT_SQL}) / SUM(#{POINT_WEIGHT_SQL})".freeze
+
+  def self.weighted_centers(visit_ids)
+    Point.where(visit_id: visit_ids)
+         .group(:visit_id)
+         .pluck(:visit_id, Arel.sql(CENTER_LATITUDE_SQL), Arel.sql(CENTER_LONGITUDE_SQL))
+         .to_h { |visit_id, latitude, longitude| [visit_id, [latitude.to_f, longitude.to_f]] }
+  end
+
+  def soft_delete!
+    update!(deleted_at: Time.current)
+  end
+
+  def soft_deleted?
+    deleted_at.present?
+  end
+
+  def confidence_band
+    return nil if confidence.nil?
+    return :high if confidence >= 70
+    return :medium if confidence >= 40
+
+    :low
+  end
+
+  def coordinates
+    points.pluck(Arel.sql('ST_Y(lonlat::geometry)'), Arel.sql('ST_X(lonlat::geometry)'))
+          .map { [_1[0].to_f, _1[1].to_f] }
+  end
+
+  def default_name
+    display_name
+  end
+
+  def display_name
+    name.presence || place&.name || location_label.presence || area&.name || DEFAULT_NAME
+  end
+
+  def clear_echoed_name
+    self.name = nil if name.present? && name.in?([place&.name, area&.name, DEFAULT_NAME])
+  end
+
+  def self.display_name_sql
+    <<~SQL.squish
+      COALESCE(
+        NULLIF(visits.name, ''),
+        NULLIF(places.name, ''),
+        NULLIF(visits.location_label, ''),
+        NULLIF(areas.name, ''),
+        #{connection.quote(DEFAULT_NAME)}
+      )
+    SQL
+  end
+
+  # in meters
+  def default_radius
+    return area&.radius if area.present?
+
+    radius = points.map do |point|
+      Geocoder::Calculations.distance_between(
+        center, [point.lat, point.lon], units: user.safe_settings.distance_unit.to_sym
+      )
+    end.max
+
+    radius && radius >= 15 ? radius : 15
+  end
+
+  def center
+    if area.present?
+      [area.lat, area.lon]
+    elsif place.present?
+      [place.lat, place.lon]
+    else
+      center_from_points
+    end
+  end
+
+  def adopt!
+    return unless demo?
+
+    Visit.transaction do
+      super
+      place&.adopt!
+      place&.tags&.demo&.find_each(&:adopt!)
+    end
+  end
+
+  private
+
+  def center_from_points
+    return [0, 0] if points.empty?
+
+    lat_sum = points.sum(&:lat)
+    lon_sum = points.sum(&:lon)
+    count = points.size.to_f
+
+    [lat_sum / count, lon_sum / count]
+  end
+
+  def propagate_adoption_to_dependents
+    return if demo?
+    return unless previously_new_record? || saved_change_to_demo? || saved_change_to_place_id?
+    return unless place&.demo?
+
+    place.adopt!
+    place.tags.demo.find_each(&:adopt!)
+  end
+
+  def cleanup_old_place_if_orphan
+    old_id, = previous_changes['place_id']
+    return unless old_id
+
+    Places::DeleteIfOrphanJob.perform_later(old_id)
+  end
+
+  def cleanup_place_if_orphan
+    return if demo?
+    return unless place_id
+
+    Places::DeleteIfOrphanJob.perform_later(place_id)
+  end
+
+  def left_active_state?
+    destroyed? ||
+      (saved_change_to_deleted_at? && deleted_at.present?) ||
+      (saved_change_to_status? && declined?)
+  end
+
+  # Keeps the Timeline calendar/filter-count cache fresh when visits are
+  # created or changed by ANY path — background import/detection jobs as well
+  # as the controller. Without this, MonthSummary (cached 5 min) serves stale
+  # status_counts right after a visit is auto-detected, so the FILTER pills
+  # read 0 until the user happens to act. Busts both the old and new month so
+  # edits that move a visit across a month boundary clear both.
+  def bust_timeline_month_summary_cache
+    return unless user
+
+    tz = user.safe_settings.timezone.presence || 'UTC'
+    spans = [[started_at, ended_at], [started_at_before_last_save, ended_at_before_last_save]]
+
+    spans.select(&:first).flat_map { |from, to| Timeline::MonthSummary.months_spanning(from, to, tz) }
+         .uniq.each { |month_start| Rails.cache.delete(Timeline::MonthSummary.cache_key_for(user, month_start)) }
+  rescue StandardError => e
+    Rails.logger.warn("[Visit##{id}] timeline month cache bust failed: #{e.class}: #{e.message}")
+  end
+end

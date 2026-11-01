@@ -1,0 +1,130 @@
+/*
+ * This is a manifest file that'll be compiled into application.css, which will include all the files
+ * listed below.
+ *
+ * Any CSS (and SCSS, if configured) file within this directory, lib/assets/stylesheets, or any plugin's
+ * vendor/assets/stylesheets directory can be referenced here using a relative path.
+ *
+ * You're free to add application-wide styles to this file and they'll appear at the bottom of the
+ * compiled file so the styles you add here take precedence over styles defined in any other CSS
+ * files in this directory. Styles in this file should be added after the last require_* statement.
+ * It is generally better to create a new file per style scope.
+ *
+ *= require_tree .
+ *= stub achievements
+ *= stub achievements_spectral
+ *= stub achievements_unlocks
+ *= stub achievements_public
+ *= require_self
+ */
+
+.emoji-icon {
+  font-size: 36px; /* Adjust size as needed */
+  text-align: center;
+  line-height: 36px; /* Same as font-size for perfect centering */
+}
+
+.timeline-box {
+  overflow: visible !important;
+}
+
+.photo-marker {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: 50%;
+}
+
+.photo-marker img {
+  border-radius: 50%;
+  width: 48px;
+  height: 48px;
+}
+.loading-spinner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 18px;
+  color: gray;
+}
+
+.loading-spinner::before {
+  content: "";
+  font-size: 18px;
+  animation: spinner 1s linear infinite;
+}
+
+.loading-spinner.done::before {
+  content: "✅";
+  animation: none;
+}
+
+/* Flash message animations */
+@keyframes slideInFromRight {
+  0% {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+  100% {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+@keyframes slideOutToRight {
+  0% {
+    transform: translateX(0);
+    opacity: 1;
+  }
+  100% {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+}
+
+/* Family feature specific styles */
+.family-member-card {
+  transition: all 0.2s ease-in-out;
+}
+
+.family-member-card:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+}
+
+.invitation-card {
+  border-left: 4px solid #f59e0b;
+}
+
+.family-invitation-form {
+  max-width: 500px;
+}
+
+/* Loading states */
+.btn:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+.loading-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(255, 255, 255, 0.8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+}
+
+/* Fix: DaisyUI table sticky headers render above navbar dropdowns */
+.table thead th,
+.table tfoot th,
+table thead th {
+  position: static !important;
+  z-index: auto !important;
+}

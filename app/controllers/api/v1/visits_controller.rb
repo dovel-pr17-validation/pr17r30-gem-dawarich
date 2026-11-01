@@ -1,0 +1,279 @@
+# frozen_string_literal: true
+
+class Api::V1::VisitsController < ApiController
+  BATCH_MAX = 100
+  BATCH_VISIT_ATTRIBUTES = %i[name status latitude longitude started_at ended_at].freeze
+  ADDRESS_ATTRIBUTES = %i[street house_number postcode city country].freeze
+
+  def index
+    visits = Visits::Finder.new(current_api_user, params).call
+    visits = privacy_zone_masker.mask_visits(visits) if mask_privacy_zones?
+
+    # Support optional pagination (backward compatible - returns all if no page param)
+    if params[:page].present?
+      per_page = [params[:per_page]&.to_i || 100, 500].min
+      visits = visits.page(params[:page]).per(per_page)
+
+      response.set_header('X-Current-Page', visits.current_page.to_s)
+      response.set_header('X-Total-Pages', visits.total_pages.to_s)
+      response.set_header('X-Total-Count', visits.total_count.to_s)
+    end
+
+    point_centers = visit_point_centers(visits)
+    serialized_visits = visits.map { |visit| serialize_visit(visit, point_centers: point_centers) }
+
+    render json: serialized_visits
+  rescue Visits::InvalidTimeRange
+    render json: { error: 'Invalid time range' }, status: :bad_request
+  end
+
+  def show
+    visit = current_api_user.scoped_visits.find(params[:id])
+    render json: serialize_visit(visit)
+  end
+
+  def create
+    attributes = create_visit_params.to_h
+    if attributes[:place_id].present? && attributes[:area_id].present?
+      return render json: { error: I18n.t('controllers.api.v1.visits.conflicting_place_and_area') },
+                    status: :unprocessable_content
+    end
+
+    if attributes[:area_id].present?
+      area = current_api_user.areas.find_by(id: attributes[:area_id])
+      unless area
+        return render json: { error: I18n.t('controllers.api.v1.visits.invalid_area') },
+                      status: :unprocessable_content
+      end
+
+      attributes['place_id'] = Places::LegacyAreaAdapter.new(user: current_api_user).resolve(area).id
+      attributes['area_id'] = nil
+    end
+
+    service = Visits::Create.new(current_api_user, attributes)
+
+    result = service.call
+
+    if result
+      render json: serialize_visit(service.visit)
+    else
+      error_message = service.errors || I18n.t('controllers.api.v1.visits.failed_to_create_visit')
+      render json: { error: error_message }, status: :unprocessable_content
+    end
+  end
+
+  def update
+    visit = current_api_user.scoped_visits.find(params[:id])
+    attributes = visit_params.to_h
+
+    if attributes[:place_id].present? && attributes[:area_id].present?
+      return render json: { error: I18n.t('controllers.api.v1.visits.conflicting_place_and_area') },
+                    status: :unprocessable_content
+    end
+
+    if attributes[:place_id].present?
+      place = current_api_user.places.find_by(id: attributes[:place_id]) ||
+              visit.suggested_places.find_by(id: attributes[:place_id])
+      if place.nil?
+        return render json: { error: I18n.t('controllers.api.v1.visits.invalid_place') },
+                      status: :unprocessable_content
+      end
+    end
+
+    if attributes[:area_id].present?
+      area = current_api_user.areas.find_by(id: attributes[:area_id])
+      if area.nil?
+        return render json: { error: I18n.t('controllers.api.v1.visits.invalid_area') },
+                      status: :unprocessable_content
+      end
+
+      mapped_place = Places::LegacyAreaAdapter.new(user: current_api_user).resolve(area)
+      attributes['place_id'] = mapped_place.id
+      attributes['area_id'] = nil
+    end
+
+    visit = update_visit(visit, attributes: attributes)
+
+    render json: serialize_visit(visit)
+  end
+
+  def merge
+    # Validate that we have at least 2 visit IDs
+    visit_ids = params[:visit_ids]
+    if visit_ids.blank? || visit_ids.length < 2
+      return render json: { error: I18n.t('controllers.api.v1.visits.at_least_2_visits_must_be_selected_for_merging') },
+                    status: :unprocessable_content
+    end
+
+    # Find all visits that belong to the current user
+    visits = current_api_user.scoped_visits.where(id: visit_ids).order(started_at: :asc)
+
+    # Ensure we found all the visits
+    if visits.length != visit_ids.length
+      return render json: { error: I18n.t('controllers.api.v1.visits.one_or_more_visits_not_found') },
+                    status: :not_found
+    end
+
+    # Use the service to merge the visits
+    service = Visits::MergeService.new(visits)
+    merged_visit = service.call
+
+    if merged_visit&.persisted?
+      render json: serialize_visit(merged_visit), status: :ok
+    else
+      render json: { error: service.errors.join(', ') }, status: :unprocessable_content
+    end
+  end
+
+  def batch
+    submitted = params[:visits]
+
+    unless submitted.is_a?(Array) && submitted.any?
+      return render json: { error: I18n.t('controllers.api.v1.visits.no_visits_provided') },
+                    status: :unprocessable_content
+    end
+
+    if submitted.size > BATCH_MAX
+      return render json: {
+        error: I18n.t('controllers.api.v1.visits.too_many_visits_maximum_is_limit_per_batch', limit: BATCH_MAX),
+        limit: BATCH_MAX,
+        requested: submitted.size
+      }, status: :unprocessable_content
+    end
+
+    results = submitted.each_with_index.map { |attributes, index| create_batched_visit(attributes, index) }
+    centers = visit_point_centers(results.filter_map { |result| result[:visit] })
+    results.each do |result|
+      result[:visit] = serialize_visit(result[:visit], point_centers: centers) if result[:visit]
+    end
+    failed_count = results.count { |result| result[:status] == 'failed' }
+    report_batch_failures(failed_count, submitted.size)
+
+    render json: {
+      results: results,
+      created_count: results.count { |result| result[:status] == 'created' },
+      duplicate_count: results.count { |result| result[:status] == 'duplicate' },
+      failed_count: failed_count
+    }
+  end
+
+  def bulk_update
+    service = Visits::BulkUpdate.new(
+      current_api_user,
+      params[:visit_ids],
+      params[:status]
+    )
+
+    result = service.call
+
+    if result
+      render json: {
+        message: I18n.t('controllers.api.v1.visits.count_visits_updated_successfully', count: result[:count]),
+        updated_count: result[:count]
+      }, status: :ok
+    else
+      render json: { error: service.errors.join(', ') }, status: :unprocessable_content
+    end
+  end
+
+  def destroy
+    visit = current_api_user.scoped_visits.find(params[:id])
+
+    # Soft delete keeps the row as a tombstone so visit detection never
+    # re-suggests it. Same contract as before: 204, points untouched.
+    if visit.update(deleted_at: Time.current)
+      head :no_content
+    else
+      render json: {
+        error: I18n.t('controllers.api.v1.visits.failed_to_delete_visit'),
+        errors: visit.errors.full_messages
+      }, status: :unprocessable_content
+    end
+  rescue ActiveRecord::RecordNotFound
+    render json: { error: I18n.t('controllers.api.v1.visits.visit_not_found') }, status: :not_found
+  end
+
+  private
+
+  def visit_point_centers(visits)
+    ids = visits.select { |visit| visit.place.nil? && visit.area.nil? }.map(&:id)
+    return {} if ids.empty?
+
+    masker = privacy_zone_masker if mask_privacy_zones?
+    Visits::PointCenters.new(current_api_user, visit_ids: ids, privacy_zone_masker: masker).call
+  end
+
+  def serialize_visit(visit, point_centers: nil)
+    centers = point_centers || visit_point_centers([visit])
+    Api::VisitSerializer.new(visit, point_center: centers[visit.id]).call
+  end
+
+  def visit_params
+    params.require(:visit).permit(:name, :place_id, :area_id, :status, :latitude, :longitude, :started_at, :ended_at)
+  end
+
+  def create_visit_params
+    params.require(:visit).permit(
+      :name, :place_id, :area_id, :status, :latitude, :longitude, :started_at, :ended_at,
+      address: ADDRESS_ATTRIBUTES
+    )
+  end
+
+  def report_batch_failures(failed_count, submitted_count)
+    return unless failed_count.positive?
+
+    Rails.logger.warn("Visits batch rejected #{failed_count} of #{submitted_count} entries")
+    ExceptionReporter.call('Batch visit creation rejected entries', 'Visits batch had rejected entries')
+  end
+
+  def create_batched_visit(attributes, index)
+    unless attributes.is_a?(ActionController::Parameters)
+      return { index: index, status: 'failed',
+               error: I18n.t('controllers.api.v1.visits.invalid_visit_payload') }
+    end
+
+    permitted = attributes.permit(*BATCH_VISIT_ATTRIBUTES, address: ADDRESS_ATTRIBUTES)
+    service = Visits::Create.new(current_api_user, permitted, report_exceptions: false)
+
+    if service.call
+      result = { index: index, status: service.duplicate? ? 'duplicate' : 'created' }
+      result[:visit] = service.visit unless service.visit.soft_deleted?
+      result
+    else
+      { index: index, status: 'failed',
+        error: service.errors || I18n.t('controllers.api.v1.visits.failed_to_create_visit') }
+    end
+  end
+
+  def merge_params
+    params.permit(visit_ids: [])
+  end
+
+  def bulk_update_params
+    params.permit(:status, visit_ids: [])
+  end
+
+  def update_visit(visit, attributes: visit_params.to_h)
+    attributes = attributes.except('latitude', 'longitude')
+    attributes['area_id'] = nil if attributes['place_id'].present?
+    attributes['name'] = attributes['name'].presence if attributes.key?('name')
+    attributes.delete('name') if visit.name.blank? && attributes['name'] == visit.display_name
+    user_provided_name = attributes['name'].present?
+    # Editing a suggested visit is an assertion that it happened — mirror the
+    # web controller and confirm it unless the request set a status itself,
+    # so the edit survives re-detection.
+    attributes['status'] = 'confirmed' if visit.suggested? && attributes['status'].blank?
+
+    visit.clear_echoed_name if attributes['place_id'].present? && !user_provided_name
+    visit.assign_attributes(attributes)
+    visit.name = nil if attributes['place_id'].present? && visit.name.present? && visit.name == visit.place&.name
+
+    if attributes['place_id'].present? && !user_provided_name && visit.place.present?
+      visit.location_label = visit.place.name
+    end
+
+    visit.save!
+
+    visit
+  end
+end

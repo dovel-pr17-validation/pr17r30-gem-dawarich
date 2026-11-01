@@ -1,0 +1,291 @@
+# frozen_string_literal: true
+
+module Timeline
+  # Aggregates month-level activity for the calendar rail in the unified timeline.
+  #
+  # Produces a 6x7 grid of day cells with tracked activity (visits + tracks) grouped
+  # in the user's timezone. Weeks start on the user's first day of week.
+  #
+  # Visit duration is stored in MINUTES; track duration is stored in SECONDS.
+  # `tracked_seconds` normalizes both into seconds for intensity bucketing.
+  class MonthSummary
+    HEAT_BUCKETS = 5
+    CACHE_TTL = 5.minutes
+
+    # Fixed-threshold heat bucket for a single day, independent of the
+    # month's max. Used by the calendar UI when it wants a stable bucket
+    # value per day (`compute_heat_bucket` is month-relative; this one is
+    # absolute). Thresholds match the rendered heat ramp:
+    #   0           → 0
+    #   < 2 hours   → 1
+    #   2..4 hours  → 2
+    #   4..8 hours  → 3
+    #   8..12 hours → 4
+    #   >= 12 hours → 5
+    def self.heat_bucket(tracked_seconds)
+      seconds = tracked_seconds.to_i
+      return 0 if seconds <= 0
+      return 1 if seconds < 2.hours
+      return 2 if seconds < 4.hours
+      return 3 if seconds < 8.hours
+      return 4 if seconds < 12.hours
+
+      5
+    end
+
+    def self.cache_key_for(user, date)
+      d = normalize_month(date)
+      tz = user.safe_settings.timezone.presence || 'UTC'
+      plan_segment = user.plan_restricted? ? 'lite' : 'pro'
+      ['timeline_month_summary', user.id, d.strftime('%Y-%m'), tz, plan_segment, 'v4']
+    end
+
+    # First days of the months a visit spans in the given timezone; a visit
+    # past midnight shows up in every one of them.
+    def self.months_spanning(from, to, timezone)
+      month = from.in_time_zone(timezone).to_date.beginning_of_month
+      last = (to || from).in_time_zone(timezone).to_date.beginning_of_month
+      months = []
+      while month <= last
+        months << month
+        month = month.next_month
+      end
+      months
+    end
+
+    def self.normalize_month(date)
+      if date.is_a?(String)
+        Date.parse("#{date}-01")
+      else
+        date.to_date.beginning_of_month
+      end
+    end
+
+    def initialize(user:, month:)
+      @user = user
+      @month_start = self.class.normalize_month(month)
+    end
+
+    def call
+      summary = Rails.cache.fetch(self.class.cache_key_for(@user, @month_start), expires_in: CACHE_TTL) do
+        build_summary
+      end
+
+      summary.merge(weeks: weeks(summary[:days]))
+    end
+
+    private
+
+    def build_summary
+      {
+        month: @month_start.strftime('%Y-%m'),
+        tz: tz,
+        days: day_data,
+        status_counts: status_counts
+      }
+    end
+
+    # Visit counts for the displayed month, keyed by status string. Powers the
+    # FILTER pills under the calendar so they reflect "this month" rather
+    # than the user's lifetime totals.
+    def status_counts
+      @status_counts ||= overlapping_visits
+                         .group(:status)
+                         .count
+                         .transform_keys { |k| visit_status_label(k) }
+    end
+
+    def tz
+      @tz ||= @user.safe_settings.timezone.presence || 'UTC'
+    end
+
+    def month_range
+      @month_range ||= @month_start.in_time_zone(tz).all_month
+    end
+
+    def day_data
+      @day_data ||= begin
+        result = {}
+
+        visit_rows.each do |(date_str, status), count|
+          result[date_str] ||= default_day
+          result[date_str][:visit_count] += count
+          result[date_str]["#{status}_count".to_sym] += count if result[date_str].key?("#{status}_count".to_sym)
+        end
+
+        visit_minutes.each do |date_str, minutes|
+          result[date_str] ||= default_day
+          result[date_str][:tracked_seconds] += (minutes * 60).round
+        end
+
+        track_seconds.each do |date_str, seconds|
+          result[date_str] ||= default_day
+          result[date_str][:tracked_seconds] += seconds.to_i
+        end
+
+        # Track count is independent of duration — a track with NULL duration
+        # still represents activity, so the day shouldn't bucket as 0/black.
+        track_count.each do |date_str, count|
+          result[date_str] ||= default_day
+          result[date_str][:track_count] += count.to_i
+        end
+
+        # Point presence keeps the day active even when track/visit pipelines
+        # haven't produced a record yet — matches Activity Overview coverage.
+        points_by_day.each do |date_str, count|
+          result[date_str] ||= default_day
+          result[date_str][:point_count] += count.to_i
+        end
+
+        result
+      end
+    end
+
+    def default_day
+      {
+        tracked_seconds: 0,
+        track_count: 0,
+        point_count: 0,
+        visit_count: 0,
+        suggested_count: 0,
+        confirmed_count: 0,
+        declined_count: 0
+      }
+    end
+
+    def visit_rows
+      visit_day_attributions[:rows]
+    end
+
+    def visit_minutes
+      visit_day_attributions[:minutes]
+    end
+
+    # A visit that runs past midnight counts on every day it covers, with
+    # that day's share of its minutes, as in the day view.
+    def visit_day_attributions
+      @visit_day_attributions ||= begin
+        rows = Hash.new(0)
+        minutes = Hash.new(0.0)
+        overlapping_visits.select(:id, :started_at, :ended_at, :duration, :status).find_each do |visit|
+          TrackDayShares.shares_between(visit.started_at, visit.ended_at, tz).each do |day, fraction|
+            rows[[day.to_s, visit.status]] += 1
+            minutes[day.to_s] += visit.duration * fraction
+          end
+        end
+        { rows: rows, minutes: minutes }
+      end
+    end
+
+    def overlapping_visits
+      @user.scoped_visits.overlapping(month_range.first, month_range.last)
+    end
+
+    def track_seconds
+      @track_seconds ||= track_day_attributions[:seconds]
+    end
+
+    def track_count
+      @track_count ||= track_day_attributions[:count]
+    end
+
+    def track_day_attributions
+      @track_day_attributions ||= begin
+        seconds = Hash.new(0.0)
+        count = Hash.new(0)
+        overlapping_tracks.find_each do |track|
+          start_day = track.start_at.in_time_zone(tz).to_date.to_s
+          count[start_day] += 1
+          TrackDayShares.shares_for(track, tz).each do |day, fraction|
+            seconds[day.to_s] += track.duration.to_f * fraction
+          end
+        end
+        { seconds: seconds, count: count }
+      end
+    end
+
+    def overlapping_tracks
+      @user.scoped_tracks.where('start_at <= ? AND end_at >= ?', month_range.last, month_range.first)
+    end
+
+    def points_by_day
+      @points_by_day ||= @user.scoped_points
+                              .where(timestamp: month_range.first.to_i..month_range.last.to_i)
+                              .group(date_sql_expr_epoch('points.timestamp'))
+                              .count
+                              .transform_keys(&:to_s)
+    end
+
+    def visit_status_label(status)
+      return status.to_s if status.is_a?(String)
+
+      Visit.statuses.key(status) || status.to_s
+    end
+
+    def date_sql_expr_epoch(column)
+      quoted_tz = ActiveRecord::Base.connection.quote(tz)
+      Arel.sql("DATE(TO_TIMESTAMP(#{column}) AT TIME ZONE #{quoted_tz})")
+    end
+
+    def weeks(days)
+      grid_start = @month_start.beginning_of_week(@user.safe_settings.date_time_preferences.week_start_symbol)
+      grid_end = grid_start + (6 * 7) - 1
+      dates = (grid_start..grid_end).to_a
+
+      cells = dates.map { |d| build_cell(d, days) }
+
+      # Heat is graded relative to the busiest day IN THIS MONTH so every
+      # month renders with full color range. Days outside the month aren't
+      # considered when computing the max, but they still get bucketed.
+      in_month_max = cells.select { |c| c[:in_month] }
+                          .map { |c| c[:tracked_seconds].to_i }
+                          .max.to_i
+
+      cells.each { |c| c[:heat_bucket] = compute_heat_bucket(c, in_month_max) }
+
+      cells.each_slice(7).to_a
+    end
+
+    def build_cell(date, days)
+      key = date.strftime('%Y-%m-%d')
+      data = days[key] || default_day
+
+      {
+        date: key,
+        in_month: date.month == @month_start.month,
+        tracked_seconds: data[:tracked_seconds],
+        track_count: data[:track_count],
+        point_count: data[:point_count],
+        visit_count: data[:visit_count],
+        suggested_count: data[:suggested_count],
+        disabled: disabled_cell?(date)
+      }
+    end
+
+    # Returns 0..HEAT_BUCKETS. Days with any activity (visits or tracks)
+    # always get at least bucket 1 so they aren't drawn as "no activity"
+    # black cells, even when their stored durations are NULL/zero.
+    def compute_heat_bucket(cell, month_max)
+      return 0 unless cell_has_activity?(cell)
+      return 1 if month_max.to_i <= 0
+
+      ratio = cell[:tracked_seconds].to_f / month_max
+      bucket = (ratio * HEAT_BUCKETS).ceil
+      bucket.clamp(1, HEAT_BUCKETS)
+    end
+
+    def cell_has_activity?(cell)
+      cell[:tracked_seconds].to_i.positive? ||
+        cell[:visit_count].to_i.positive? ||
+        cell[:track_count].to_i.positive? ||
+        cell[:point_count].to_i.positive?
+    end
+
+    def disabled_cell?(date)
+      return false unless @user.plan_restricted?
+
+      cutoff = @user.data_window_start.to_date
+      date < cutoff
+    end
+  end
+end

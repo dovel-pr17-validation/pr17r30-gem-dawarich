@@ -1,0 +1,91 @@
+<div data-controller="place-creation inline-tag">
+  <div class="modal z-[10000]" data-place-creation-target="modal">
+    <div class="modal-box max-w-2xl place-creation-modal">
+      <h3 class="font-bold text-lg mb-4" data-place-creation-target="modalTitle"><%= t('.create_new_place') %></h3>
+
+      <%= form_with scope: :place, url: places_path, method: :post, data: {
+        place_creation_target: "form",
+        action: "turbo:submit-end->place-creation#onSubmitEnd"
+      } do |f| %>
+        <%= f.hidden_field :latitude, data: { place_creation_target: "latitudeInput" } %>
+        <%= f.hidden_field :longitude, data: { place_creation_target: "longitudeInput" } %>
+        <%= f.hidden_field :source, value: "manual" %>
+        <%= hidden_field_tag :visit_id, nil, data: { place_creation_target: "visitIdInput" } %>
+
+        <div class="space-y-4">
+          <div class="form-control">
+            <label class="label">
+              <span class="label-text font-semibold"><%= t('.place_name') %></span>
+            </label>
+            <%= f.text_field :name,
+                placeholder: t('.enter_place_name'),
+                class: "input input-bordered w-full",
+                data: { place_creation_target: "nameInput" },
+                required: true %>
+          </div>
+
+          <div class="form-control">
+            <label class="label">
+              <span class="label-text font-semibold"><%= t('.visit_radius') %></span>
+            </label>
+            <%= f.number_field :visit_radius,
+                value: Place.column_defaults.fetch('visit_radius', 50),
+                min: 1,
+                max: Place::MAX_VISIT_RADIUS,
+                step: 1,
+                class: "input input-bordered w-full tabular-nums",
+                data: { place_creation_target: "visitRadiusInput" },
+                required: true %>
+            <label class="label">
+              <span class="label-text-alt"><%= t('.visit_radius_hint') %></span>
+            </label>
+          </div>
+
+          <div class="form-control">
+            <label class="label">
+              <span class="label-text font-semibold"><%= t('.note') %></span>
+            </label>
+            <%= f.text_area :note,
+                placeholder: t('.add_a_personal_note_about_this_place'),
+                class: "textarea textarea-bordered w-full bg-base-100",
+                rows: 3,
+                data: { place_creation_target: "noteInput" } %>
+            <label class="label">
+              <span class="label-text-alt"><%= t('.optional_add_any_notes_or_details_about_this_place') %></span>
+            </label>
+          </div>
+
+          <label class="label cursor-pointer gap-2">
+            <%= f.check_box :geofence, { class: 'toggle toggle-primary toggle-sm', data: { testid: 'create-place-geofence' } }, '1', '0' %>
+            <span class="label-text flex-1"><%= t('places.drawer.geofence') %></span>
+          </label>
+
+          <%= render 'shared/place_tags', surface: 'creation', selected_tags: [] %>
+
+          <div class="divider"><%= t('.suggested_places') %></div>
+
+          <div class="form-control">
+            <label class="label">
+              <span class="label-text font-semibold"><%= t('.nearby_places') %></span>
+            </label>
+            <div class="relative">
+              <%= turbo_frame_tag "nearby-places", data: { place_creation_target: "nearbyFrame" } do %>
+                <p class="text-sm text-base-content/70"><%= t('.open_modal_to_load_nearby_suggestions') %></p>
+              <% end %>
+            </div>
+          </div>
+        </div>
+
+        <div class="modal-action">
+          <button type="button" class="btn btn-ghost" data-action="click->place-creation#close"><%= t('.cancel') %></button>
+          <%= f.submit t('.create_place'), class: "btn btn-primary",
+              data: { place_creation_target: "submitButton", disable_with: false, turbo_submits_with: t('.saving') } %>
+        </div>
+      <% end %>
+      <%= render 'shared/inline_tag_form', surface: 'creation' %>
+    </div>
+    <div class="modal-backdrop" data-action="click->place-creation#close"></div>
+  </div>
+
+  <div id="place-creation-data" class="hidden"></div>
+</div>

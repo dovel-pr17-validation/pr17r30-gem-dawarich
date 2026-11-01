@@ -1,0 +1,535 @@
+# frozen_string_literal: true
+
+require 'swagger_helper'
+
+describe 'Visits API', type: :request do
+  center_schema = {
+    type: :object, nullable: true,
+    description: 'Point-derived fallback when Place/Area are absent; null without visible coordinates',
+    properties: { latitude: { type: :number }, longitude: { type: :number } },
+    required: %w[latitude longitude]
+  }
+
+  let(:user) { create(:user) }
+  let(:api_key) { user.api_key }
+  let(:Authorization) { "Bearer #{api_key}" }
+  let(:place) { create(:place) }
+  let(:test_visit) { create(:visit, user: user, place: place) }
+
+  path '/api/v1/visits' do
+    get 'List visits' do
+      parameter name: :mask_privacy_zones, in: :query, type: :boolean, required: false,
+                description: 'Leave out data inside the user\'s privacy zones'
+      tags 'Visits'
+      produces 'application/json'
+      parameter name: :Authorization, in: :header, type: :string, required: true, description: 'Bearer token'
+      parameter name: :start_at, in: :query, type: :string, required: false,
+                description: 'ISO 8601; pair with end_at; must not be later than end_at; ' \
+                             'optional only for complete bounding-box selections'
+      parameter name: :end_at, in: :query, type: :string, required: false,
+                description: 'ISO 8601; pair with start_at; must not be earlier than start_at; ' \
+                             'optional only for complete bounding-box selections'
+      parameter name: :selection, in: :query, type: :string, required: false,
+                description: 'Set to "true" for area-based search'
+      parameter name: :sw_lat, in: :query, type: :number, required: false,
+                description: 'Southwest latitude for area search'
+      parameter name: :sw_lng, in: :query, type: :number, required: false,
+                description: 'Southwest longitude for area search'
+      parameter name: :ne_lat, in: :query, type: :number, required: false,
+                description: 'Northeast latitude for area search'
+      parameter name: :ne_lng, in: :query, type: :number, required: false,
+                description: 'Northeast longitude for area search'
+
+      response '200', 'visits found' do
+        let(:start_at) { 1.week.ago.iso8601 }
+        let(:end_at) { Time.current.iso8601 }
+
+        before do
+          create(:visit, user: user, place: place, started_at: 3.days.ago, ended_at: 3.days.ago + 1.hour)
+          create(:visit, user: user, place: nil, name: nil, location_label: 'Main Street 5', status: :suggested,
+                         started_at: 2.days.ago, ended_at: 2.days.ago + 1.hour)
+        end
+
+        schema type: :array,
+               items: {
+                 type: :object,
+                 properties: {
+                   id: { type: :integer },
+                   name: { type: :string,
+                           description: 'Displayed name: the custom Visit Name, Place name, or Location Label' },
+                   custom_name: { type: :string, nullable: true, description: 'User-defined Visit Name' },
+                   display_name: { type: :string, description: 'Visit Name, Place name, or Location Label' },
+                   location_label: { type: :string, nullable: true },
+                   place_id: { type: :integer, nullable: true },
+                   area_id: { type: :integer, nullable: true, deprecated: true },
+                   status: { type: :string, enum: %w[suggested confirmed declined] },
+                   started_at: { type: :string, format: :datetime },
+                   ended_at: { type: :string, format: :datetime },
+                   duration: { type: :integer, description: 'Duration in minutes' },
+                   center: center_schema,
+                   place: {
+                     type: :object,
+                     nullable: true,
+                     properties: {
+                       id: { type: :integer, nullable: true },
+                       name: { type: :string },
+                       latitude: { type: :number },
+                       longitude: { type: :number },
+                       visit_radius: { type: :integer }
+                     }
+                   }
+                 },
+                 required: %w[id name display_name status started_at ended_at duration center]
+               }
+
+        run_test!
+      end
+
+      response '400', 'invalid or missing time range' do
+        let(:start_at) { 'not-a-date' }
+        let(:end_at) { Time.current.iso8601 }
+
+        schema type: :object,
+               properties: { error: { type: :string } },
+               required: %w[error]
+
+        run_test!
+      end
+
+      response '401', 'unauthorized' do
+        let(:Authorization) { 'Bearer invalid-token' }
+        run_test!
+      end
+    end
+
+    post 'Create visit' do
+      tags 'Visits'
+      consumes 'application/json'
+      produces 'application/json'
+      parameter name: :Authorization, in: :header, type: :string, required: true, description: 'Bearer token'
+      parameter name: :visit, in: :body, schema: {
+        type: :object,
+        properties: {
+          visit: {
+            type: :object,
+            properties: {
+              name: { type: :string },
+              latitude: { type: :number },
+              longitude: { type: :number },
+              started_at: { type: :string, format: :datetime },
+              ended_at: { type: :string, format: :datetime },
+              address: {
+                type: :object,
+                description: 'Optional address stored on a newly created place; ' \
+                             'ignored when the visit reuses a place within 100 m',
+                properties: {
+                  street: { type: :string },
+                  house_number: { type: :string },
+                  postcode: { type: :string },
+                  city: { type: :string },
+                  country: { type: :string }
+                }
+              }
+            },
+            required: %w[name latitude longitude started_at ended_at]
+          }
+        }
+      }
+
+      response '200', 'visit created' do
+        let(:visit) do
+          {
+            visit: {
+              name: 'Test Visit',
+              latitude: 52.52,
+              longitude: 13.405,
+              started_at: '2023-12-01T10:00:00Z',
+              ended_at: '2023-12-01T12:00:00Z'
+            }
+          }
+        end
+
+        schema type: :object,
+               required: %w[center],
+               properties: {
+                 id: { type: :integer },
+                 name: { type: :string },
+                 status: { type: :string },
+                 started_at: { type: :string, format: :datetime },
+                 ended_at: { type: :string, format: :datetime },
+                 duration: { type: :integer },
+                 center: center_schema,
+                 place: {
+                   type: :object,
+                   properties: {
+                     id: { type: :integer },
+                     name: { type: :string },
+                     latitude: { type: :number },
+                     longitude: { type: :number },
+                     address: { type: :string, nullable: true }
+                   }
+                 }
+               }
+
+        run_test!
+      end
+
+      response '422', 'invalid request' do
+        let(:visit) do
+          {
+            visit: {
+              name: '',
+              latitude: 52.52,
+              longitude: 13.405,
+              started_at: '2023-12-01T10:00:00Z',
+              ended_at: '2023-12-01T12:00:00Z'
+            }
+          }
+        end
+
+        run_test!
+      end
+
+      response '401', 'unauthorized' do
+        let(:Authorization) { 'Bearer invalid-token' }
+        let(:visit) do
+          {
+            visit: {
+              name: 'Test Visit',
+              latitude: 52.52,
+              longitude: 13.405,
+              started_at: '2023-12-01T10:00:00Z',
+              ended_at: '2023-12-01T12:00:00Z'
+            }
+          }
+        end
+
+        run_test!
+      end
+    end
+  end
+
+  path '/api/v1/visits/{id}' do
+    patch 'Update visit' do
+      tags 'Visits'
+      consumes 'application/json'
+      produces 'application/json'
+      parameter name: :id, in: :path, type: :integer, required: true, description: 'Visit ID'
+      parameter name: :Authorization, in: :header, type: :string, required: true, description: 'Bearer token'
+      parameter name: :visit, in: :body, schema: {
+        type: :object,
+        properties: {
+          visit: {
+            type: :object,
+            properties: {
+              name: { type: :string },
+              place_id: { type: :integer },
+              area_id: {
+                type: :integer,
+                nullable: true,
+                deprecated: true,
+                description: 'Legacy Area ID. It is translated to place_id; do not send both fields.'
+              },
+              status: { type: :string, enum: %w[suggested confirmed declined] }
+            }
+          }
+        }
+      }
+
+      response '200', 'visit updated' do
+        let(:id) { test_visit.id }
+        let(:visit) { { visit: { name: 'Updated Visit' } } }
+
+        schema type: :object,
+               required: %w[center],
+               properties: {
+                 id: { type: :integer },
+                 name: { type: :string },
+                 status: { type: :string },
+                 started_at: { type: :string, format: :datetime },
+                 ended_at: { type: :string, format: :datetime },
+                 duration: { type: :integer },
+                 center: center_schema,
+                 place: { type: [:object, 'null'] }
+               }
+
+        run_test!
+      end
+
+      response '404', 'visit not found' do
+        let(:id) { 999_999 }
+        let(:visit) { { visit: { name: 'Updated Visit' } } }
+
+        run_test!
+      end
+
+      response '401', 'unauthorized' do
+        let(:Authorization) { 'Bearer invalid-token' }
+        let(:id) { test_visit.id }
+        let(:visit) { { visit: { name: 'Updated Visit' } } }
+
+        run_test!
+      end
+    end
+
+    delete 'Delete visit' do
+      tags 'Visits'
+      parameter name: :id, in: :path, type: :integer, required: true, description: 'Visit ID'
+      parameter name: :Authorization, in: :header, type: :string, required: true, description: 'Bearer token'
+
+      response '204', 'visit deleted' do
+        let(:id) { test_visit.id }
+
+        run_test!
+      end
+
+      response '404', 'visit not found' do
+        let(:id) { 999_999 }
+
+        run_test!
+      end
+
+      response '401', 'unauthorized' do
+        let(:Authorization) { 'Bearer invalid-token' }
+        let(:id) { test_visit.id }
+
+        run_test!
+      end
+    end
+  end
+
+  path '/api/v1/visits/{id}/possible_places' do
+    get 'Get possible places for visit' do
+      tags 'Visits'
+      produces 'application/json'
+      parameter name: :id, in: :path, type: :integer, required: true, description: 'Visit ID'
+      parameter name: :Authorization, in: :header, type: :string, required: true, description: 'Bearer token'
+
+      response '200', 'possible places found' do
+        let(:id) { test_visit.id }
+
+        schema type: :array,
+               items: {
+                 type: :object,
+                 properties: {
+                   id: { type: [:integer, 'null'] },
+                   name: { type: :string },
+                   latitude: { type: :number },
+                   longitude: { type: :number },
+                   osm_id: { type: [:integer, :string, 'null'] },
+                   osm_type: { type: [:string, 'null'] },
+                   osm_key: { type: [:string, 'null'] },
+                   osm_value: { type: [:string, 'null'] },
+                   city: { type: [:string, 'null'] },
+                   country: { type: [:string, 'null'] },
+                   source: { type: :string },
+                   geodata: { type: :object }
+                 }
+               }
+
+        run_test!
+      end
+
+      response '404', 'visit not found' do
+        let(:id) { 999_999 }
+
+        run_test!
+      end
+
+      response '401', 'unauthorized' do
+        let(:Authorization) { 'Bearer invalid-token' }
+        let(:id) { test_visit.id }
+
+        run_test!
+      end
+    end
+  end
+
+  path '/api/v1/visits/merge' do
+    post 'Merge visits' do
+      tags 'Visits'
+      consumes 'application/json'
+      produces 'application/json'
+      parameter name: :Authorization, in: :header, type: :string, required: true, description: 'Bearer token'
+      parameter name: :merge_params, in: :body, schema: {
+        type: :object,
+        properties: {
+          visit_ids: {
+            type: :array,
+            items: { type: :integer },
+            minItems: 2,
+            description: 'Array of visit IDs to merge (minimum 2)'
+          }
+        },
+        required: %w[visit_ids]
+      }
+
+      response '200', 'visits merged' do
+        let(:visit1) { create(:visit, user: user) }
+        let(:visit2) { create(:visit, user: user) }
+        let(:merge_params) { { visit_ids: [visit1.id, visit2.id] } }
+
+        schema type: :object,
+               required: %w[center],
+               properties: {
+                 id: { type: :integer },
+                 name: { type: :string },
+                 status: { type: :string },
+                 started_at: { type: :string, format: :datetime },
+                 ended_at: { type: :string, format: :datetime },
+                 duration: { type: :integer },
+                 center: center_schema,
+                 place: { type: [:object, 'null'] }
+               }
+
+        run_test!
+      end
+
+      response '422', 'invalid request' do
+        let(:merge_params) { { visit_ids: [test_visit.id] } }
+
+        run_test!
+      end
+
+      response '401', 'unauthorized' do
+        let(:Authorization) { 'Bearer invalid-token' }
+        let(:merge_params) { { visit_ids: [test_visit.id] } }
+
+        run_test!
+      end
+    end
+  end
+
+  path '/api/v1/visits/bulk_update' do
+    post 'Bulk update visits' do
+      tags 'Visits'
+      consumes 'application/json'
+      produces 'application/json'
+      parameter name: :Authorization, in: :header, type: :string, required: true, description: 'Bearer token'
+      parameter name: :bulk_params, in: :body, schema: {
+        type: :object,
+        properties: {
+          visit_ids: {
+            type: :array,
+            items: { type: :integer },
+            description: 'Array of visit IDs to update'
+          },
+          status: {
+            type: :string,
+            enum: %w[suggested confirmed declined],
+            description: 'New status for the visits'
+          }
+        },
+        required: %w[visit_ids status]
+      }
+
+      response '200', 'visits updated' do
+        let(:visit1) { create(:visit, user: user, status: 'suggested') }
+        let(:visit2) { create(:visit, user: user, status: 'suggested') }
+        let(:bulk_params) { { visit_ids: [visit1.id, visit2.id], status: 'confirmed' } }
+
+        schema type: :object,
+               properties: {
+                 message: { type: :string },
+                 updated_count: { type: :integer }
+               }
+
+        run_test!
+      end
+
+      response '422', 'invalid request' do
+        let(:bulk_params) { { visit_ids: [test_visit.id], status: 'invalid_status' } }
+
+        run_test!
+      end
+
+      response '401', 'unauthorized' do
+        let(:Authorization) { 'Bearer invalid-token' }
+        let(:bulk_params) { { visit_ids: [test_visit.id], status: 'confirmed' } }
+
+        run_test!
+      end
+    end
+  end
+  path '/api/v1/visits/batch' do
+    post 'Create visits in batch' do
+      tags 'Visits'
+      consumes 'application/json'
+      produces 'application/json'
+      parameter name: :Authorization, in: :header, type: :string, required: true, description: 'Bearer token'
+      parameter name: :batch, in: :body, schema: {
+        type: :object,
+        properties: {
+          visits: {
+            type: :array,
+            maxItems: Api::V1::VisitsController::BATCH_MAX,
+            items: {
+              type: :object,
+              properties: {
+                name: { type: :string },
+                latitude: { type: :number },
+                longitude: { type: :number },
+                started_at: { type: :string, format: 'date-time' },
+                ended_at: { type: :string, format: 'date-time' },
+                status: { type: :string, enum: %w[suggested confirmed declined] }
+              },
+              required: %w[name latitude longitude started_at ended_at]
+            }
+          }
+        },
+        required: %w[visits]
+      }
+
+      response '200', 'batch processed' do
+        let(:batch) do
+          {
+            visits: [
+              {
+                name: 'Home',
+                latitude: 52.52,
+                longitude: 13.405,
+                started_at: '2023-12-01T10:00:00Z',
+                ended_at: '2023-12-01T12:00:00Z',
+                status: 'suggested'
+              }
+            ]
+          }
+        end
+
+        schema type: :object,
+               properties: {
+                 results: {
+                   type: :array,
+                   items: {
+                     type: :object,
+                     properties: {
+                       index: { type: :integer },
+                       status: { type: :string, enum: %w[created duplicate failed] },
+                       visit: { type: :object, properties: { center: center_schema }, required: %w[center] },
+                       error: { type: :string }
+                     }
+                   }
+                 },
+                 created_count: { type: :integer },
+                 duplicate_count: { type: :integer },
+                 failed_count: { type: :integer }
+               }
+
+        run_test!
+      end
+
+      response '422', 'invalid request' do
+        let(:batch) { { visits: [] } }
+
+        run_test!
+      end
+
+      response '401', 'unauthorized' do
+        let(:Authorization) { 'Bearer invalid-token' }
+        let(:batch) { { visits: [] } }
+
+        run_test!
+      end
+    end
+  end
+end

@@ -1,0 +1,28 @@
+<div id="<%= dom_id import %>">
+  <table class="table">
+    <thead>
+      <tr>
+        <th><%= t('.name') %></th>
+        <th><%= t('.imported_points') %></th>
+        <th><%= t('.created_at') %></th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>
+          <%= link_to import.name, import, class: 'underline hover:no-underline' %> (<%= import.source %>)
+        </td>
+        <td>
+          <%= "#{number_with_delimiter import.points.size}" %>
+        </td>
+        <td><%= human_datetime(import.created_at, current_user.safe_settings.timezone) %></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <% if action_name != "show" %>
+    <%= link_to t('.show_this_import'), import, class: "btn" %>
+    <%= link_to t('.edit_this_import'), edit_import_path(import), class: "btn ml-2" %>
+    <hr class="mt-6">
+  <% end %>
+</div>

@@ -1,0 +1,273 @@
+# frozen_string_literal: true
+
+class InsightsController < ApplicationController
+  ROUTES_FAILURE_TTL = 1.hour
+
+  before_action :authenticate_user!
+
+  def index
+    authorize :insights, :index?
+
+    set_available_years
+    @selected_year = params[:year] || @available_years.first&.to_s || Time.current.year.to_s
+    @all_time = @selected_year == 'all'
+    @year_locked = year_locked?
+
+    load_year_stats
+    return if @year_locked
+
+    load_year_totals
+    load_activity_heatmap
+    @all_time ? load_years_overview : load_months
+  end
+
+  def details
+    authorize :insights, :details?
+
+    set_available_years
+    @selected_year = params[:year] || @available_years.first&.to_s || Time.current.year.to_s
+    @all_time = @selected_year == 'all'
+    @year_locked = year_locked?
+
+    load_year_stats
+    return if @year_locked || current_user.plan_restricted?
+
+    load_year_totals
+    load_comparison_data if @previous_year_stats&.any?
+
+    if @all_time
+      set_default_patterns
+    else
+      load_yearly_patterns
+      load_monthly_digest
+    end
+  end
+
+  def routes
+    authorize :insights, :routes?
+
+    query = Stats::YearRoutesQuery.new(current_user, params[:year].to_i)
+    cache_key = query.cache_key
+    render json: { lines: Rails.cache.fetch(cache_key, expires_in: 24.hours) { query.call || [] } }
+  rescue ActiveRecord::StatementInvalid => e
+    ExceptionReporter.call(e)
+    # Cached briefly so a year whose query times out is not rerun on every view.
+    Rails.cache.write(cache_key, [], expires_in: ROUTES_FAILURE_TTL) if cache_key
+    render json: { lines: [] }
+  end
+
+  private
+
+  def set_available_years
+    @available_years = current_user.stats.where(month: 1..12).distinct.pluck(:year).sort.reverse
+    scoped_years = current_user.scoped_stats.where(month: 1..12).distinct.pluck(:year)
+    @locked_years = current_user.plan_restricted? ? (@available_years - scoped_years).to_set : Set.new
+  end
+
+  def year_locked?
+    return false if @all_time || !current_user.plan_restricted?
+
+    @locked_years.include?(@selected_year.to_i)
+  end
+
+  def load_year_stats
+    scoped_stats = current_user.scoped_stats.where(month: 1..12)
+
+    if @all_time
+      @year_stats = scoped_stats.order(year: :desc, month: :desc)
+      @previous_year_stats = Stat.none
+    else
+      @selected_year = @selected_year.to_i
+      @previous_year = @selected_year - 1
+      @year_stats = scoped_stats.where(year: @selected_year).order(:month)
+      @previous_year_stats = scoped_stats.where(year: @previous_year).order(:month)
+    end
+  end
+
+  def load_year_totals
+    @year_totals = Insights::YearTotalsCalculator.new(@year_stats, distance_unit: distance_unit).call
+
+    @total_distance = @year_totals.total_distance
+    @countries_count = @year_totals.countries_count
+    @cities_count = @year_totals.cities_count
+    @countries_list = @year_totals.countries_list
+    @days_traveling = @year_totals.days_traveling
+    @biggest_month = @year_totals.biggest_month
+  end
+
+  def load_years_overview
+    year_cards = Stats::YearCardsQuery.new(current_user)
+    @stats_by_year = year_cards.stats_by_year
+    @year_distances = year_cards.year_distances
+
+    points_stats = ::StatsQuery.new(current_user).points_stats
+    @points_total = points_stats[:total]
+    @points_reverse_geocoded = points_stats[:geocoded]
+    @points_reverse_geocoded_percentage = points_stats[:geocoded_percentage]
+    @points_reverse_geocoded_without_data = points_stats[:without_data]
+  end
+
+  def load_months
+    @month_distances = Stat.year_distance(@selected_year, current_user)
+  end
+
+  def load_comparison_data
+    comparison = Insights::YearComparisonCalculator.new(
+      @year_totals,
+      @previous_year_stats,
+      distance_unit: distance_unit
+    ).call
+
+    @prev_total_distance = comparison.prev_total_distance
+    @prev_countries_count = comparison.prev_countries_count
+    @prev_cities_count = comparison.prev_cities_count
+    @prev_days_traveling = comparison.prev_days_traveling
+    @prev_biggest_month = comparison.prev_biggest_month
+    @distance_change = comparison.distance_change
+    @countries_change = comparison.countries_change
+    @cities_change = comparison.cities_change
+    @days_change = comparison.days_change
+  end
+
+  def load_activity_heatmap
+    return if @all_time || current_user.full_access?
+
+    @activity_heatmap = Insights::ActivityHeatmapCalculator.new(@year_stats, @selected_year).call
+  end
+
+  def load_yearly_patterns
+    yearly_digest = fetch_or_calculate_yearly_digest
+    travel_patterns = yearly_digest&.travel_patterns || {}
+
+    @time_of_day = travel_patterns['time_of_day'] || {}
+    @day_of_week = calculate_yearly_day_of_week
+    @seasonality = travel_patterns['seasonality'] || {}
+    @activity_breakdown = travel_patterns['activity_breakdown'] || {}
+    @top_visited_locations = fetch_yearly_top_visits
+  end
+
+  def fetch_or_calculate_yearly_digest
+    # First check if we have a valid cached digest in the database
+    digest = current_user.digests.yearly.find_by(year: @selected_year)
+
+    # If no digest exists, calculate it
+    return calculate_and_cache_digest if digest.nil?
+
+    # Use Rails cache with digest's updated_at as cache version
+    # This avoids expensive queries to build cache key on every request
+    Rails.cache.fetch(digest.insights_cache_key, expires_in: 1.hour) do
+      # Double-check staleness inside cache block (in case of race conditions)
+      if digest_stale?(digest)
+        calculate_and_cache_digest
+      else
+        digest
+      end
+    end
+  end
+
+  def calculate_and_cache_digest
+    Users::Digests::CalculateYear.new(current_user.id, @selected_year).call
+  end
+
+  def digest_stale?(digest)
+    # Check if essential data is missing
+    return true if digest.travel_patterns.blank?
+
+    # Check if stats have been updated since digest was last calculated
+    latest_stat_update = current_user.scoped_stats.where(year: @selected_year).maximum(:updated_at)
+    return false if latest_stat_update.nil?
+
+    digest.updated_at < latest_stat_update
+  end
+
+  def calculate_yearly_day_of_week
+    # Load only required columns for weekly_pattern calculation
+    # weekly_pattern is a model method that uses monthly_distances, year, and month
+    digests = current_user.digests.monthly
+                          .where(year: @selected_year)
+                          .select(:id, :year, :month, :monthly_distances)
+
+    digests.each_with_object(Array.new(7, 0)) do |digest, weekly_totals|
+      pattern = digest.weekly_pattern
+      next unless pattern.is_a?(Array) && pattern.size == 7
+
+      pattern.each_with_index do |distance, idx|
+        weekly_totals[idx] += distance.to_i
+      end
+    end
+  end
+
+  def fetch_yearly_top_visits
+    start_time = Time.zone.local(@selected_year, 1, 1)
+    end_time = Time.zone.local(@selected_year, 12, 31).end_of_year
+
+    display_name_sql = Visit.display_name_sql
+    order_sql = "visit_count DESC, total_duration DESC, (#{display_name_sql}) COLLATE \"C\" ASC"
+
+    current_user.scoped_visits.confirmed.where(started_at: start_time..end_time)
+                .left_joins(:place, :area)
+                .group(Arel.sql(display_name_sql))
+                .select("#{display_name_sql} AS display_name, COUNT(*) as visit_count, SUM(duration) as total_duration")
+                .order(Arel.sql(order_sql)).limit(5)
+                .map do |visit|
+                  {
+                    name: visit.read_attribute(:display_name),
+                    visit_count: visit.visit_count,
+                    total_duration: visit.total_duration
+                  }
+                end
+  end
+
+  def load_monthly_digest
+    @selected_month = determine_selected_month
+    @available_months = current_user.scoped_stats
+                                    .where(year: @selected_year)
+                                    .pluck(:month)
+                                    .sort
+
+    @monthly_digest = current_user.digests
+                                  .monthly
+                                  .find_by(year: @selected_year, month: @selected_month)
+
+    return unless @available_months.include?(@selected_month)
+
+    return unless @monthly_digest.nil? || monthly_digest_stale?(@monthly_digest)
+
+    @monthly_digest = Users::Digests::CalculateMonth
+                      .new(current_user.id, @selected_year, @selected_month)
+                      .call
+  end
+
+  def monthly_digest_stale?(digest)
+    latest_stat_update = current_user.scoped_stats
+                                     .where(year: digest.year, month: digest.month)
+                                     .maximum(:updated_at)
+    return false if latest_stat_update.nil?
+
+    digest.updated_at < latest_stat_update
+  end
+
+  def determine_selected_month
+    if params[:month].present?
+      params[:month].to_i
+    elsif @selected_year == Time.current.year
+      current_user.scoped_stats.where(year: @selected_year).maximum(:month) || Time.current.month
+    else
+      current_user.scoped_stats.where(year: @selected_year).maximum(:month) || 12
+    end
+  end
+
+  def set_default_patterns
+    @selected_month = 'all'
+    @available_months = []
+    @time_of_day = {}
+    @day_of_week = Array.new(7, 0)
+    @seasonality = {}
+    @activity_breakdown = {}
+    @top_visited_locations = []
+  end
+
+  def distance_unit
+    current_user.safe_settings.distance_unit
+  end
+end

@@ -1,0 +1,323 @@
+# frozen_string_literal: true
+
+require 'rails_helper'
+
+RSpec.describe Places::NameFetcher do
+  describe '#call' do
+    subject(:service) { described_class.new(place) }
+
+    let(:place) do
+      create(
+        :place,
+        name: Place::DEFAULT_NAME,
+        city: nil,
+        country: nil,
+        geodata: {},
+        lonlat: 'POINT(10.0 10.0)'
+      )
+    end
+
+    let(:geocoder_result) do
+      double(
+        'geocoder_result',
+        data: {
+          'properties' => {
+            'name' => 'Central Park',
+            'city' => 'New York',
+            'country' => 'United States'
+          }
+        }
+      )
+    end
+
+    before do
+      configure_instance_geocoding
+      allow(Geocoder).to receive(:search).and_return([geocoder_result])
+    end
+
+    context 'when geocoding is successful' do
+      it 'calls Geocoder with correct parameters' do
+        expect(Geocoder).to receive(:search)
+          .with([place.lat, place.lon], units: :km, limit: 1, distance_sort: true)
+          .and_return([geocoder_result])
+
+        service.call
+      end
+
+      it 'updates place name from geocoder data' do
+        expect { service.call }.to change(place, :name)
+          .from(Place::DEFAULT_NAME)
+          .to('Central Park, New York')
+      end
+
+      it 'updates place city from geocoder data' do
+        expect { service.call }.to change(place, :city)
+          .from(nil)
+          .to('New York')
+      end
+
+      it 'updates place country from geocoder data' do
+        expect { service.call }.to change(place, :country)
+          .from(nil)
+          .to('United States')
+      end
+
+      it 'saves the place' do
+        expect(place).to receive(:save!)
+
+        service.call
+      end
+
+      context 'when a device-named place gets a real address' do
+        let(:place) do
+          create(
+            :place,
+            name: 'Visited place',
+            city: nil,
+            country: nil,
+            geodata: {},
+            lonlat: 'POINT(10.0 10.0)'
+          )
+        end
+
+        it 'renames the place' do
+          expect { service.call }.to change { place.reload.name }.from('Visited place').to('Central Park, New York')
+        end
+
+        it 'propagates the new name to the visit location label' do
+          visit = create(:visit, place: place, user: place.user, name: nil, location_label: 'Visited place')
+
+          service.call
+
+          expect(visit.reload).to have_attributes(name: nil, location_label: 'Central Park, New York')
+        end
+
+        it 'leaves the custom Visit name alone while refreshing its location label' do
+          visit = create(:visit, place: place, user: place.user, name: 'Dentist', location_label: 'Visited place')
+
+          service.call
+
+          expect(visit.reload).to have_attributes(name: 'Dentist', location_label: 'Central Park, New York')
+        end
+      end
+
+      context 'when the name is locked by the user' do
+        let(:place) do
+          create(
+            :place,
+            name: "Mum's house",
+            name_locked_at: 1.day.ago,
+            city: nil,
+            country: nil,
+            geodata: {},
+            lonlat: 'POINT(10.0 10.0)'
+          )
+        end
+
+        it 'keeps the user-supplied name' do
+          expect { service.call }.not_to change(place, :name)
+        end
+
+        it 'still refreshes city and country' do
+          expect { service.call }.to change(place, :city).from(nil).to('New York')
+        end
+
+        it 'propagates the locked name to visits still using the default location label' do
+          visit = create(:visit, place: place, user: place.user, name: nil, location_label: Place::DEFAULT_NAME)
+
+          service.call
+
+          expect(visit.reload).to have_attributes(name: nil, location_label: "Mum's house")
+        end
+
+        it 'clears a default Visit name so the visit shows the locked name' do
+          visit = create(:visit, place: place, user: place.user, name: Place::DEFAULT_NAME)
+
+          service.call
+
+          expect(visit.reload).to have_attributes(name: nil, display_name: "Mum's house")
+        end
+      end
+
+      context 'when DawarichSettings.store_geodata? is enabled' do
+        before do
+          allow(DawarichSettings).to receive(:store_geodata?).and_return(true)
+        end
+
+        it 'stores geodata in the place' do
+          expect { service.call }.to change(place, :geodata)
+            .from({})
+            .to(geocoder_result.data)
+        end
+      end
+
+      context 'when DawarichSettings.store_geodata? is disabled' do
+        before do
+          allow(DawarichSettings).to receive(:store_geodata?).and_return(false)
+        end
+
+        it 'does not store geodata in the place' do
+          expect { service.call }.not_to change(place, :geodata)
+        end
+      end
+
+      context 'when place has visits with default name' do
+        let!(:visit_with_default_name) do
+          create(:visit, name: nil, location_label: Place::DEFAULT_NAME)
+        end
+        let!(:visit_with_custom_name) do
+          create(:visit, name: 'Custom Visit Name', location_label: Place::DEFAULT_NAME)
+        end
+
+        before do
+          place.visits << visit_with_default_name
+          place.visits << visit_with_custom_name
+        end
+
+        it 'updates the default location label to the new Place name' do
+          expect { service.call }.to \
+            change { visit_with_default_name.reload.location_label }
+            .from(Place::DEFAULT_NAME)
+            .to('Central Park, New York')
+        end
+
+        it 'does not update custom Visit names' do
+          expect { service.call }.not_to(change { visit_with_custom_name.reload.name })
+          expect(visit_with_custom_name.reload.location_label).to eq('Central Park, New York')
+        end
+      end
+
+      context 'when using transactions' do
+        it 'wraps updates in a transaction' do
+          expect(ActiveRecord::Base).to \
+            receive(:transaction).and_call_original
+
+          service.call
+        end
+
+        it 'rolls back changes if save fails' do
+          allow(place).to receive(:save!).and_raise(ActiveRecord::RecordInvalid)
+          allow(ExceptionReporter).to receive(:call)
+          allow(Rails.logger).to receive(:error)
+
+          result = service.call
+          expect(result).to be_nil
+          expect(place.reload.name).to eq(Place::DEFAULT_NAME)
+        end
+      end
+
+      it 'returns the updated place' do
+        result = service.call
+        expect(result).to eq(place)
+        expect(result.name).to eq('Central Park, New York')
+      end
+    end
+
+    context 'when the geocoder provider times out' do
+      before do
+        allow(ExceptionReporter).to receive(:call)
+        allow(Rails.logger).to receive(:warn)
+        allow(Geocoder).to receive(:search).and_raise(Geocoder::LookupTimeout.new('execution expired'))
+      end
+
+      it 'returns nil without reporting an application exception' do
+        expect(service.call).to be_nil
+        expect(ExceptionReporter).not_to have_received(:call)
+        expect(Rails.logger).to have_received(:warn).with(/Geocoding provider error in NameFetcher/)
+      end
+    end
+
+    context 'when geocoding fails unexpectedly' do
+      let(:error) { StandardError.new('unexpected failure') }
+
+      before do
+        allow(ExceptionReporter).to receive(:call)
+        allow(Geocoder).to receive(:search).and_raise(error)
+      end
+
+      it 'reports the application exception' do
+        expect(service.call).to be_nil
+        expect(ExceptionReporter).to have_received(:call).with(error)
+      end
+    end
+
+    context 'when geocoding returns no results' do
+      before do
+        allow(Geocoder).to receive(:search).and_return([])
+      end
+
+      it 'returns nil' do
+        expect(service.call).to be_nil
+      end
+
+      it 'does not update the place' do
+        expect { service.call }.not_to change(place, :name)
+      end
+
+      it 'does not call save on the place' do
+        expect(place).not_to receive(:save!)
+
+        service.call
+      end
+    end
+
+    context 'when geocoding returns nil result' do
+      before do
+        allow(Geocoder).to receive(:search).and_return([nil])
+      end
+
+      it 'returns nil' do
+        expect(service.call).to be_nil
+      end
+
+      it 'does not update the place' do
+        expect { service.call }.not_to change(place, :name)
+      end
+    end
+
+    context 'when geocoder result has missing properties' do
+      let(:incomplete_geocoder_result) do
+        double(
+          'geocoder_result',
+          data: {
+            'properties' => {
+              'name' => 'Partial Place',
+              'city' => nil,
+              'country' => 'United States'
+            }
+          }
+        )
+      end
+
+      before do
+        allow(Geocoder).to receive(:search).and_return([incomplete_geocoder_result])
+      end
+
+      it 'updates place with available data' do
+        service.call
+
+        expect(place.name).to eq('Partial Place')
+        expect(place.city).to be_nil
+        expect(place.country).to eq('United States')
+      end
+    end
+
+    context 'when geocoder result has no properties' do
+      let(:no_properties_result) do
+        double('geocoder_result', data: {})
+      end
+
+      before do
+        allow(Geocoder).to receive(:search).and_return([no_properties_result])
+      end
+
+      it 'handles missing properties gracefully' do
+        expect { service.call }.not_to raise_error
+
+        expect(place.name).to eq(Place::DEFAULT_NAME)
+        expect(place.city).to be_nil
+        expect(place.country).to be_nil
+      end
+    end
+  end
+end

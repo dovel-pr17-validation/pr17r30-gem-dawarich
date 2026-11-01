@@ -1,0 +1,321 @@
+# frozen_string_literal: true
+
+class Points::VectorTileQuery
+  class InvalidTileCoordinatesError < StandardError; end
+
+  Result = Struct.new(:tile, :feature_count, :limit, keyword_init: true) do
+    def truncated?
+      feature_count >= limit
+    end
+  end
+
+  EXTENT = 4096
+  BUFFER = 256
+  # Candidate rows must cover the ST_AsMVTGeom buffer, or markers clip at tile seams
+  MARGIN = (BUFFER.to_f / EXTENT)
+  # The z0 world tile's geography bbox does not contain its own planar extent —
+  # measured against a 1.5-degree global grid it drops 27k points that the plain
+  # intersection keeps, so the prefilter must not run there. z1 measured clean,
+  # but each of its tiles still spans a full 180 degrees, where wrap direction
+  # is ambiguous in principle; the tier starts at z2 rather than rely on that.
+  MIN_PREFILTER_ZOOM = 2
+  # Below this zoom tiles carry no per-point attributes: features are
+  # centroid+count aggregates, so nothing can be popped up or identified.
+  MIN_POINT_ATTRIBUTE_ZOOM = 5
+  # PostGIS can underestimate `lonlat &&` in a dense tile by five orders of
+  # magnitude and walk the GiST index for a one-day range (#3830). A scope this
+  # small is fenced so it is read through (user_id, timestamp) instead; larger
+  # scopes keep the geography index.
+  FENCE_MAX_ROWS = 50_000
+  LAYER_NAME = 'points'
+  # Points are not merged at this zoom: zooming cannot separate points that
+  # share a location, so each must stay selectable on its own (#3846).
+  MAX_ZOOM = 22
+  TILE_PIXELS = 512
+  WEB_MERCATOR_WORLD = 40_075_016.685578488
+  # Heat reflects time spent, not recording frequency; cap gaps between recordings.
+  MAX_DWELL_SECONDS = 300
+  # Only nearby samples can represent a stationary long gap. Use a fixed
+  # web-mercator distance so changing zoom cannot turn a gap into a stop.
+  MAX_STATIONARY_DISTANCE_METERS = 50
+  # Bounds the per-query cost (VectorTileTimeout, ENV-overridable);
+  # PgBouncer-safe because SET LOCAL runs inside an explicit transaction
+  # (see Visits::Detection::CandidateLoader for the pattern)
+
+  # fence_key: stable identity of the scope shared by every tile of a map view;
+  # without it the scope's SQL stands in.
+  def initialize(scope:, z:, x:, y:, fence_key: nil) # rubocop:disable Naming/MethodParameterName
+    @scope = scope
+    @fence_key = fence_key
+    @z = parse_integer(z)
+    @x = parse_integer(x)
+    @y = parse_integer(y)
+  end
+
+  def call
+    validate_tile_coordinates!
+
+    row = with_statement_timeout { |conn| conn.select_one(tile_sql) }
+
+    Result.new(
+      tile: row['tile'],
+      feature_count: row['feature_count'].to_i,
+      limit: tile_feature_limit
+    )
+  end
+
+  # The features the tile is built from, for specs and diagnostics.
+  def feature_rows
+    validate_tile_coordinates!
+
+    with_statement_timeout { |conn| conn.select_all(rows_sql).to_a }
+  end
+
+  # Display-pixels per decimation cell on 512px tiles. Tiers from the 1M-point
+  # benchmark (lib/perf/vector_tile_benchmark.rb): 1px put 243k features/13.5 MB
+  # in a dense z11 tile, 4px keeps it ~15k/<1 MB — and a 4px cell is smaller
+  # than the 12px circle markers, so nothing visible is lost below z14.
+  def grid_px
+    z < 14 ? 4 : 1
+  end
+
+  # Strictly above the maximum distinct grid cells in a margin-expanded tile —
+  # a pure bug-guard below MAX_ZOOM; a reachable LIMIT would drop an arbitrary
+  # subset of cells.
+  # ponytail: at MAX_ZOOM one feature per point, so ~333k points inside one
+  # ~10 m tile get truncated; group exact duplicates there if that ever happens.
+  def tile_feature_limit
+    cells_per_axis = ((TILE_PIXELS * (1 + (2 * MARGIN))) / grid_px).ceil + 1
+    (cells_per_axis**2) + 1
+  end
+
+  private
+
+  attr_reader :scope, :z, :x, :y, :fence_key
+
+  # z/x/y are validated Integers and every other interpolated value is program-
+  # computed — the only user-influenced SQL is the tile_scope relation.
+  def tile_sql
+    <<~SQL.squish
+      #{with_clauses}
+      SELECT #{sanitized_mvt_call} AS tile, COUNT(*) AS feature_count
+      FROM features
+      WHERE geom IS NOT NULL
+    SQL
+  end
+
+  def rows_sql
+    <<~SQL.squish
+      #{with_clauses}
+      SELECT * FROM features WHERE geom IS NOT NULL
+    SQL
+  end
+
+  def sanitized_mvt_call
+    Point.sanitize_sql_array(["ST_AsMVT(features.*, ?, #{EXTENT}, 'geom')", LAYER_NAME])
+  end
+
+  # LEAD sorts candidates by time; the 1M-point benchmark in
+  # lib/perf/vector_tile_benchmark.rb measured up to 1457ms with this window.
+  # Hash aggregation avoids a second sort for DISTINCT ON. MIN() keeps
+  # the representative deterministic; count=1 cells are exact, and merged
+  # cells never show popups, so mixed MINs are invisible.
+  def with_clauses
+    <<~SQL
+      WITH candidates AS (#{candidates_sql}),
+      dwelled AS (
+        SELECT candidates.*,
+          CASE WHEN LEAD(timestamp) OVER timeline - timestamp > #{MAX_DWELL_SECONDS}
+            AND NOT ST_DWithin(geom_3857, LEAD(geom_3857) OVER timeline,
+                               #{MAX_STATIONARY_DISTANCE_METERS})
+            THEN 0
+            ELSE LEAST(COALESCE(LEAD(timestamp) OVER timeline - timestamp, 0),
+                       #{MAX_DWELL_SECONDS})
+          END AS dwell
+        FROM candidates
+        WINDOW timeline AS (ORDER BY timestamp)
+      ),
+      features AS (
+        SELECT COUNT(*) AS count, SUM(dwell)::bigint AS dwell,
+          MIN(timestamp) AS timestamp, MAX(timestamp) AS max_timestamp,
+          #{point_attribute_aggregates}
+          #{mvt_geom_expression('ST_Centroid(ST_Collect(geom_3857))')} AS geom
+        FROM dwelled
+        GROUP BY #{snap_expression}
+        LIMIT #{tile_feature_limit}
+      )
+    SQL
+  end
+
+  def point_attribute_aggregates
+    return '' unless point_regime?
+
+    <<~SQL.squish
+      MIN(id) AS id, MIN(battery) AS battery,
+      MIN(track_id) AS track_id, MIN(lock_version) AS revision,
+      MIN(altitude) AS altitude, MIN(velocity) AS velocity,
+      MIN(latitude) AS latitude, MIN(longitude) AS longitude,
+    SQL
+  end
+
+  def point_regime?
+    z >= MIN_POINT_ATTRIBUTE_ZOOM
+  end
+
+  def prefilterable?
+    z >= MIN_PREFILTER_ZOOM
+  end
+
+  def candidates_sql
+    branches = [candidate_branch_sql(shift: 0)]
+    branches << candidate_branch_sql(shift: antimeridian_shift) unless antimeridian_shift.zero?
+
+    branches.join(' UNION ALL ')
+  end
+
+  # Edge tiles (x = 0/max) have buffer bands beyond the antimeridian: a wrapped
+  # branch finds those points and translates them into the tile's frame. The
+  # shift preserves grid alignment (cell size divides the world width exactly).
+  def antimeridian_shift
+    return 0 if z.zero?
+
+    max_index = (1 << z) - 1
+    return WEB_MERCATOR_WORLD if x.zero?
+    return -WEB_MERCATOR_WORLD if x == max_index
+
+    0
+  end
+
+  def candidate_branch_sql(shift:)
+    columns =
+      if point_regime?
+        <<~SQL.squish
+          points.id AS id, points.battery AS battery,
+          points.track_id AS track_id, points.lock_version AS lock_version,
+          points.altitude AS altitude, points.velocity AS velocity,
+          ST_Y(points.lonlat::geometry) AS latitude,
+          ST_X(points.lonlat::geometry) AS longitude,
+        SQL
+      else
+        ''
+      end
+
+    <<~SQL.squish
+      SELECT points.timestamp AS timestamp, #{columns}
+        #{translated_geom_expression(shift)} AS geom_3857
+      FROM (#{fenced_tile_scope.to_sql}) AS points
+      WHERE points.lonlat IS NOT NULL
+        #{spatial_prefilter(shift)}
+        AND ST_Intersects(
+          points.lonlat::geometry,
+          ST_Transform(#{margined_envelope(shift)}, 4326)
+        )
+    SQL
+  end
+
+  def translated_geom_expression(shift)
+    geom = 'ST_Transform(points.lonlat::geometry, 3857)'
+    return geom if shift.zero?
+
+    "ST_Translate(#{geom}, #{-shift}, 0)"
+  end
+
+  # ST_TileEnvelope clamps its margin at the world bound — edge tiles get NO
+  # buffer past the antimeridian. The wrapped branch searches a hand-built seam
+  # band instead, kept inside the mercator domain so its 4326 transform never
+  # yields |lon| > 180 (a geography cast of that would wrap unpredictably).
+  def margined_envelope(shift)
+    return "ST_TileEnvelope(#{z}, #{x}, #{y}, margin => #{MARGIN})" if shift.zero?
+
+    seam_band_envelope
+  end
+
+  def seam_band_envelope
+    half = WEB_MERCATOR_WORLD / 2
+    tile_width = WEB_MERCATOR_WORLD / (1 << z)
+    margin_meters = tile_width * MARGIN
+    y_max = [half - (y * tile_width) + margin_meters, half].min
+    y_min = [half - ((y + 1) * tile_width) - margin_meters, -half].max
+
+    if x.zero? # the west buffer wraps to the far east of the world
+      "ST_MakeEnvelope(#{half - margin_meters}, #{y_min}, #{half}, #{y_max}, 3857)"
+    else # the east buffer wraps to the far west
+      "ST_MakeEnvelope(#{-half}, #{y_min}, #{-half + margin_meters}, #{y_max}, 3857)"
+    end
+  end
+
+  # lonlat is geography, so the planar test alone cannot use the GiST index
+  def spatial_prefilter(shift)
+    return '' unless prefilterable?
+
+    "AND points.lonlat && ST_Transform(#{margined_envelope(shift)}, 4326)::geography"
+  end
+
+  def snap_expression
+    return 'id' if z == MAX_ZOOM
+
+    "ST_SnapToGrid(geom_3857, #{cell_size})"
+  end
+
+  def mvt_geom_expression(geom)
+    "ST_AsMVTGeom(#{geom}, ST_TileEnvelope(#{z}, #{x}, #{y}), #{EXTENT}, #{BUFFER}, true)"
+  end
+
+  def cell_size
+    WEB_MERCATOR_WORLD / (1 << z) / TILE_PIXELS * grid_px
+  end
+
+  def tile_scope
+    bare_scope.select(:id, :timestamp, :battery, :altitude, :velocity, :lonlat,
+                      :track_id, :lock_version)
+  end
+
+  # OFFSET 0 stops PostgreSQL pushing the spatial filter into the subquery.
+  def fenced_tile_scope
+    fenced? ? tile_scope.offset(0) : tile_scope
+  end
+
+  # Every tile of a map view shares the scope, so the count runs once per view.
+  # A stale answer only changes the plan, never the points returned.
+  def fenced?
+    return @fenced if defined?(@fenced)
+
+    @fenced = prefilterable? && Rails.cache.fetch(fence_cache_key, expires_in: 10.minutes) do
+      bare_scope.limit(FENCE_MAX_ROWS + 1).count(:all) <= FENCE_MAX_ROWS
+    end
+  end
+
+  def fence_cache_key
+    ['points_tile_fence', FENCE_MAX_ROWS, fence_key || Digest::SHA256.hexdigest(bare_scope.to_sql)]
+  end
+
+  def bare_scope
+    scope.except(:select, :order, :includes, :preload, :eager_load)
+  end
+
+  def with_statement_timeout
+    conn = Point.connection
+    conn.transaction do
+      conn.exec_query('SET LOCAL jit = off', 'VectorTileQuery JIT')
+      conn.exec_query("SET LOCAL statement_timeout = #{VectorTileTimeout.query_timeout_ms}",
+                      'VectorTileQuery Timeout')
+      yield conn
+    end
+  end
+
+  def parse_integer(value)
+    return value if value.is_a?(Integer)
+
+    Integer(value, 10)
+  rescue ArgumentError, TypeError
+    raise InvalidTileCoordinatesError
+  end
+
+  def validate_tile_coordinates!
+    raise InvalidTileCoordinatesError if z.negative? || z > MAX_ZOOM
+
+    max_index = (1 << z) - 1
+    raise InvalidTileCoordinatesError if x.negative? || y.negative?
+    raise InvalidTileCoordinatesError if x > max_index || y > max_index
+  end
+end

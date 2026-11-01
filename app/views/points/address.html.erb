@@ -1,0 +1,7 @@
+<%= turbo_frame_tag "point-address-#{@point.id}" do %>
+  <% if (address = @point.address_line) %>
+    <div>
+      <span class="font-semibold"><%= t('.address') %></span> <%= address %>
+    </div>
+  <% end %>
+<% end %>

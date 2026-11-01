@@ -1,0 +1,216 @@
+# frozen_string_literal: true
+
+class ImportsController < ApplicationController
+  include ActiveStorage::SetCurrent
+  include Sortable
+
+  self.page_refresh_morphing = true
+
+  SORTABLE_COLUMNS = %w[name status created_at processed byte_size].freeze
+  CLIENT_WRAPPED_METADATA_KEY = 'dawarich_client_wrapped'
+  ORIGINAL_FILENAME_METADATA_KEY = 'dawarich_original_filename'
+
+  before_action :authenticate_user!
+  before_action :authenticate_active_user!, only: %i[new create]
+  before_action :set_import, only: %i[show edit update destroy download]
+  before_action :authorize_import, only: %i[show edit update destroy download]
+  before_action :validate_points_limit, only: %i[new create]
+
+  after_action :verify_authorized, except: %i[index]
+  after_action :verify_policy_scoped, only: %i[index]
+
+  def index
+    scope = policy_scope(Import)
+            .select(:id, :name, :source, :created_at, :updated_at, :processed, :doubles, :status, :error_message, :demo,
+                    :additional_data_extraction_status)
+            .with_attached_file
+
+    @imports = sorted(scope).page(params[:page])
+  end
+
+  def show; end
+
+  def download
+    @download = Imports::Download.new(@import)
+    return redirect_to @download.url, allow_other_host: true if @download.ready?
+
+    Rails.cache.fetch(['import-download', @import.id, @import.file.blob_id], expires_in: 1.minute) do
+      Imports::PrepareDownloadJob.perform_later(@import.id, @import.file.blob_id)
+      true
+    end
+    response.set_header('Refresh', '3')
+    render :download, status: :accepted
+  end
+
+  def edit; end
+
+  def new
+    @import = Import.new
+
+    authorize @import
+  end
+
+  def update
+    if unknown_source_param?
+      @import.errors.add(:source, :inclusion)
+      return render :edit, status: :unprocessable_content
+    end
+
+    @import.update(import_params)
+
+    redirect_to imports_url, notice: I18n.t('controllers.imports.import_was_successfully_updated'), status: :see_other
+  end
+
+  def create
+    @import = Import.new
+
+    authorize @import
+
+    raw_files = extract_raw_files
+    if raw_files.empty?
+      redirect_to new_import_path, alert: I18n.t('controllers.imports.no_files_were_selected_for_upload'),
+status: :unprocessable_content and return
+    end
+
+    @created_imports = []
+    process_raw_files(raw_files)
+
+    unless @created_imports.any?
+      redirect_to(new_import_path,
+                  alert: I18n.t('controllers.imports.no_valid_file_references_were_found_please_upload_files_using'),
+                  status: :unprocessable_content) and return
+    end
+
+    redirect_to imports_url,
+                notice: I18n.t('controllers.imports.size_files_are_queued_to_be_imported_in_background',
+                               size: @created_imports.size),
+                status: :see_other
+  rescue StandardError => e
+    cleanup_failed_imports
+    report_import_error(e)
+
+    redirect_to new_import_path, alert: e.message, status: :unprocessable_content
+  end
+
+  def destroy
+    @import.deleting!
+    Imports::DestroyJob.perform_later(@import.id)
+
+    respond_to do |format|
+      format.html do
+        redirect_to imports_url, notice: I18n.t('controllers.imports.import_is_being_deleted'), status: :see_other
+      end
+      format.turbo_stream
+    end
+  end
+
+  private
+
+  def set_import
+    @import = Import.find(params[:id])
+  end
+
+  def authorize_import
+    authorize @import
+  end
+
+  def import_params
+    params.require(:import).permit(:name, :source, files: [])
+  end
+
+  def unknown_source_param?
+    source = import_params[:source]
+    source.present? && Import.sources.exclude?(source)
+  end
+
+  def extract_raw_files
+    files_params = params.dig(:import, :files)
+    Array(files_params).reject(&:blank?)
+  end
+
+  def process_raw_files(raw_files)
+    raw_files.each do |item|
+      next if item.is_a?(ActionDispatch::Http::UploadedFile)
+
+      import = create_import_from_signed_id(item)
+      @created_imports << import if import.present?
+    end
+  end
+
+  def cleanup_failed_imports
+    return if @created_imports.blank?
+
+    import_ids = @created_imports.map(&:id).compact
+    Import.where(id: import_ids).destroy_all if import_ids.any?
+  end
+
+  def report_import_error(error)
+    Rails.logger.error "Import error: #{error.message}"
+    Rails.logger.error error.backtrace.join("\n")
+    ExceptionReporter.call(error)
+  end
+
+  def create_import_from_signed_id(item)
+    descriptor = upload_descriptor(item)
+    signed_id = descriptor.fetch('signed_id')
+    Rails.logger.debug "Creating import from signed ID: #{signed_id[0..20]}..."
+
+    blob = ActiveStorage::Blob.find_signed(signed_id)
+    original_filename = verified_original_filename(blob, descriptor)
+    mark_client_wrapped(blob, original_filename.present?) if descriptor.key?('client_wrapped')
+
+    import_name = generate_unique_import_name(original_filename || blob.filename.to_s)
+    import = current_user.imports.build(name: import_name)
+    import.file.attach(blob)
+
+    import.save!
+
+    import
+  end
+
+  def upload_descriptor(item)
+    parsed = JSON.parse(item.to_s)
+    return parsed if parsed.is_a?(Hash) && parsed['signed_id'].present?
+
+    { 'signed_id' => item.to_s }
+  rescue JSON::ParserError
+    { 'signed_id' => item.to_s }
+  end
+
+  def verified_original_filename(blob, descriptor)
+    return unless ActiveModel::Type::Boolean.new.cast(descriptor['client_wrapped'])
+
+    original_filename = File.basename(descriptor['original_filename'].to_s)
+    return if original_filename.blank?
+    return unless blob.filename.to_s == ActiveStorage::Filename.new("#{original_filename}.zip").to_s
+
+    original_filename
+  end
+
+  def mark_client_wrapped(blob, wrapped)
+    metadata = blob.metadata.merge(CLIENT_WRAPPED_METADATA_KEY => wrapped)
+    metadata[ORIGINAL_FILENAME_METADATA_KEY] = blob.filename.to_s.delete_suffix('.zip') if wrapped
+    blob.update!(metadata:)
+  end
+
+  def generate_unique_import_name(original_name)
+    return original_name unless current_user.imports.exists?(name: original_name)
+
+    # Extract filename and extension
+    basename = File.basename(original_name, File.extname(original_name))
+    extension = File.extname(original_name)
+
+    # Add current datetime
+    timestamp = Time.current.strftime('%Y%m%d_%H%M%S')
+    "#{basename}_#{timestamp}#{extension}"
+  end
+
+  def validate_points_limit
+    limit_exceeded = PointsLimitExceeded.new(current_user).call
+
+    return unless limit_exceeded
+
+    redirect_to imports_path, alert: I18n.t('controllers.imports.points_limit_exceeded'),
+status: :unprocessable_content
+  end
+end

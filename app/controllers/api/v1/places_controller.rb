@@ -1,0 +1,259 @@
+# frozen_string_literal: true
+
+module Api
+  module V1
+    class PlacesController < ApiController
+      CO_LOCATED_THRESHOLD_METERS = 50
+
+      wrap_parameters :place, include: %i[name latitude longitude source note visit_radius geofence archived tag_ids]
+
+      before_action :set_place, only: %i[show update destroy]
+
+      def index
+        @places = current_api_user.places.includes(:tags, :active_visits)
+
+        if params[:tag_ids].present?
+          tag_ids = Array(params[:tag_ids])
+
+          # Separate numeric tag IDs from "untagged"
+          numeric_tag_ids = tag_ids.reject { |id| id == 'untagged' }.map(&:to_i)
+          include_untagged = tag_ids.include?('untagged')
+
+          if numeric_tag_ids.any? && include_untagged
+            # Both tagged and untagged: use OR logic to preserve eager loading
+            tagged_ids = current_api_user.places.with_tags(numeric_tag_ids).pluck(:id)
+            untagged_ids = current_api_user.places.without_tags.pluck(:id)
+            combined_ids = (tagged_ids + untagged_ids).uniq
+            @places = current_api_user.places.includes(:tags, :active_visits).where(id: combined_ids)
+          elsif numeric_tag_ids.any?
+            # Only tagged places with ANY of the selected tags (OR logic)
+            @places = @places.with_tags(numeric_tag_ids)
+          elsif include_untagged
+            # Only untagged places
+            @places = @places.without_tags
+          end
+        end
+
+        @places =
+          case params[:filter]
+          when 'all'       then @places
+          when 'archived'  then @places.archived
+          when 'manual'    then @places.manual.not_archived
+          when 'confirmed' then @places.linked_to_confirmed_visits(current_api_user).not_archived
+          when 'unconfirmed' then @places.unconfirmed_for(current_api_user)
+          when 'tagged' then @places.tagged.not_archived
+          else @places.map_visible(current_api_user)
+          end
+
+        @places = privacy_zone_masker.mask_places(@places) if mask_privacy_zones?
+
+        # Support pagination (defaults to page 1 with all results if no page param)
+        page = params[:page].presence || 1
+        per_page = [params[:per_page]&.to_i || 100, 500].min
+
+        # Apply pagination only if page param is explicitly provided
+        @places = @places.page(page).per(per_page) if params[:page].present?
+
+        # Always set pagination headers for consistency
+        if @places.respond_to?(:current_page)
+          # Paginated collection
+          response.set_header('X-Current-Page', @places.current_page.to_s)
+          response.set_header('X-Total-Pages', @places.total_pages.to_s)
+          response.set_header('X-Total-Count', @places.total_count.to_s)
+        else
+          # Non-paginated collection - treat as single page with all results
+          total = @places.count
+          response.set_header('X-Current-Page', '1')
+          response.set_header('X-Total-Pages', '1')
+          response.set_header('X-Total-Count', total.to_s)
+        end
+
+        render json: @places.map { |place| serialize_place(place) }
+      end
+
+      def show
+        render json: serialize_place(@place)
+      end
+
+      def create
+        @place = current_api_user.places.build(place_params.except(:tag_ids))
+        @place.user_named = true
+        @place.reattribute_suggested_visits_on_create = true
+
+        if @place.save
+          add_tags if tag_ids.present?
+          @place = current_api_user.places.includes(:tags, :active_visits).find(@place.id)
+
+          render json: serialize_place(@place), status: :created
+        else
+          render json: { errors: @place.errors.full_messages }, status: :unprocessable_entity
+        end
+      end
+
+      def update
+        if @place.update(place_params)
+          set_tags if params[:place][:tag_ids]
+          @place = current_api_user.places.includes(:tags, :active_visits).find(@place.id)
+
+          render json: serialize_place(@place)
+        else
+          render json: { errors: @place.errors.full_messages }, status: :unprocessable_entity
+        end
+      end
+
+      def destroy
+        Places::Destroy.new(user: current_api_user, place: @place).call
+
+        head :no_content
+      end
+
+      def nearby
+        unless params[:latitude].present? && params[:longitude].present?
+          return render json: { error: I18n.t('controllers.api.v1.places.latitude_and_longitude_are_required') },
+                        status: :bad_request
+        end
+
+        results = Places::NearbySearch.new(
+          user: current_api_user,
+          latitude: params[:latitude].to_f,
+          longitude: params[:longitude].to_f,
+          radius: params[:radius]&.to_f || 0.5,
+          limit: params[:limit]&.to_i || 10
+        ).call
+
+        render json: { places: results }
+      end
+
+      def search
+        unless params[:lat].present? && params[:lon].present?
+          return render json: { error: I18n.t('controllers.api.v1.places.lat_and_lon_are_required') },
+                        status: :bad_request
+        end
+
+        lat = params[:lat].to_f
+        lon = params[:lon].to_f
+        unless lat.between?(-90, 90) && lon.between?(-180, 180)
+          return render json: { error: I18n.t('controllers.api.v1.places.invalid_coordinates') }, status: :bad_request
+        end
+
+        radius = [[params[:radius]&.to_f || 1.0, 0.01].max, 5.0].min
+        limit = [[params[:limit]&.to_i || 10, 1].max, 50].min
+        query = params[:q].to_s.strip
+
+        external_search =
+          if query.length >= 2
+            Places::Search.new(user: current_api_user, query: query, latitude: lat, longitude: lon,
+                               radius: radius, limit: limit)
+          else
+            Places::NearbySearch.new(user: current_api_user, latitude: lat, longitude: lon,
+                                     radius: radius, limit: limit, cache: true)
+          end
+        external_places = external_search.call
+
+        user_places = Places::UserSearch.new(
+          user: current_api_user, latitude: lat, longitude: lon, radius: radius, limit: limit, query: query
+        ).call
+        user_places_by_name = user_places.group_by { |place| place[:name].to_s.strip.downcase }
+        external_places.reject! do |place|
+          co_located_saved_place?(place, user_places_by_name)
+        end
+        places = (user_places + external_places)
+                 .sort_by { |place| distance_from_query(place, lat, lon) }
+                 .first(limit)
+
+        areas = Areas::Nearby.new(
+          user: current_api_user, latitude: lat, longitude: lon, radius: radius, query: query
+        ).call
+
+        render json: { places: places, areas: areas, throttled: external_search.throttled? }
+      end
+
+      private
+
+      def distance_from_query(place, latitude, longitude)
+        return Float::INFINITY if place[:latitude].nil? || place[:longitude].nil?
+
+        distance = Geocoder::Calculations.distance_between(
+          [latitude, longitude],
+          [place[:latitude], place[:longitude]],
+          units: :km
+        )
+        distance.is_a?(Numeric) && distance.finite? ? distance : Float::INFINITY
+      end
+
+      def co_located_saved_place?(external, user_places_by_name)
+        return false if external[:latitude].nil? || external[:longitude].nil?
+
+        matches = user_places_by_name[external[:name].to_s.strip.downcase]
+        return false if matches.blank?
+
+        matches.any? do |place|
+          next false if place[:latitude].nil? || place[:longitude].nil?
+
+          distance = Geocoder::Calculations.distance_between(
+            [external[:latitude], external[:longitude]],
+            [place[:latitude], place[:longitude]],
+            units: :km
+          )
+          distance.is_a?(Numeric) && distance.finite? && (distance * 1000) <= CO_LOCATED_THRESHOLD_METERS
+        end
+      end
+
+      def set_place
+        @place = current_api_user.places.includes(:tags, :active_visits).find(params[:id])
+      end
+
+      def place_params
+        params.require(:place).permit(
+          :name, :latitude, :longitude, :source, :note, :visit_radius, :geofence, :archived, tag_ids: []
+        )
+      end
+
+      def tag_ids
+        ids = params.dig(:place, :tag_ids)
+        Array(ids).compact
+      end
+
+      def add_tags
+        return if tag_ids.empty?
+
+        tags = current_api_user.tags.where(id: tag_ids)
+        @place.tags << tags
+      end
+
+      def set_tags
+        tag_ids_param = Array(params.dig(:place, :tag_ids)).compact
+        tags = current_api_user.tags.where(id: tag_ids_param)
+        @place.tags = tags
+      end
+
+      def serialize_place(place)
+        {
+          id: place.id,
+          name: place.name,
+          latitude: place.lat,
+          longitude: place.lon,
+          source: place.source,
+          note: place.note,
+          visit_radius: place.visit_radius,
+          geofence: place.geofence,
+          icon: place.tags.first&.icon,
+          color: place.tags.first&.color,
+          visits_count: place.active_visits.size,
+          name_locked: place.name_locked?,
+          archived: place.archived?,
+          created_at: place.created_at,
+          tags: place.tags.map do |tag|
+            {
+              id: tag.id,
+              name: tag.name,
+              icon: tag.icon,
+              color: tag.color,
+              privacy_radius_meters: tag.privacy_radius_meters
+            }
+          end
+        }
+      end
+    end
+  end
+end

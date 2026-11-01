@@ -1,0 +1,1295 @@
+/* Timeline Feed — Timestamps-left layout */
+
+/* Loading state: Turbo adds [busy] while fetching a frame's src */
+#timeline-feed-frame[busy] .timeline-feed-placeholder {
+  display: none;
+}
+
+#timeline-feed-frame[busy]::after {
+  content: "";
+  display: block;
+  width: 1.25rem;
+  height: 1.25rem;
+  margin: 2rem auto;
+  border: 2px solid oklch(var(--bc) / 0.15);
+  border-top-color: oklch(var(--p));
+  border-radius: 50%;
+  animation: timeline-spin 0.6s linear infinite;
+}
+
+@keyframes timeline-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Tighter padding for the timeline tab. No bottom padding — the main
+   column extends to the panel edge and scrolls independently. */
+.tab-content[data-tab-content="timeline-feed"] {
+  margin: -24px;
+  padding: 16px 16px 0;
+}
+
+/* --- Entries container ---
+   Dual-purpose: historical flex layout for legacy `.timeline-entry` rows
+   AND the new `<ol>` wrapper for `.visit-row` children. List reset keeps
+   both layouts clean. */
+.timeline-entries {
+  display: flex;
+  flex-direction: column;
+  list-style: none;
+  padding: 0;
+  margin: 0;
+
+  /* Single source of truth for the row grid. Visit rows, journey legs and
+     gap legs all read these, which is what keeps the spine unbroken and
+     dead straight across three different row types. */
+  --tl-time-col: 52px;
+  --tl-rail-col: 18px;
+  --tl-col-gap: 0.5rem;
+  --tl-pad-x: 0.5rem;
+  /* Centre of the rail column, measured from a row's left border edge. */
+  --tl-rail-x: calc(
+    var(--tl-pad-x) +
+    var(--tl-time-col) +
+    var(--tl-col-gap) +
+    var(--tl-rail-col) /
+    2
+  );
+  /* Dot centre, measured from a visit row's top border edge. Also where the
+     spine starts on the first row and stops on the last. */
+  --tl-dot-y: 1.15rem;
+  --tl-rail-color: oklch(var(--bc) / 0.16);
+  /* Every piece of secondary text on a row shares one tone, set at the
+     lowest alpha that still clears 4.5:1 in both themes. Hierarchy below the
+     place name comes from size, order and grouping — fading text past
+     legibility is not a hierarchy technique. */
+  --tl-text-2: oklch(var(--bc) / 0.66);
+}
+
+/* --- The spine ---
+   Each row paints its own segment across its full padded height. Rows abut,
+   so the segments fuse into one continuous line without the container having
+   to know how many rows there are or how tall they got. */
+.timeline-entries > * {
+  position: relative;
+}
+
+.timeline-entries > *::before {
+  content: "";
+  position: absolute;
+  left: var(--tl-rail-x);
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  border-radius: 1px;
+  background: var(--tl-rail-color);
+  pointer-events: none;
+}
+
+/* Cap the line at the first and last dot so it reads as a day with a
+   beginning and an end, not a line that got cut off. Only visit rows carry a
+   dot — when a drive opens or closes the day its rail runs the full row,
+   because the movement itself is the record. */
+.timeline-entries > .visit-row:first-child::before {
+  top: var(--tl-dot-y);
+}
+
+.timeline-entries > .visit-row:last-child::before {
+  bottom: calc(100% - var(--tl-dot-y));
+}
+
+/* Helper shown when search/filter hides every visit row on a day that has
+   visits. Positioned just below the list so it reads as an explanation for
+   the apparent emptiness without shifting layout when hidden. */
+.timeline-entries-empty-filtered {
+  margin-top: 0.5rem;
+  padding: 0.75rem;
+  text-align: center;
+  border: 1px dashed oklch(var(--bc) / 0.15);
+  border-radius: 0.5rem;
+  background: oklch(var(--b2) / 0.4);
+}
+
+.timeline-entries-empty-filtered p {
+  margin: 0 0 0.4rem;
+}
+
+/* --- Each entry: time column + content column --- */
+.timeline-entry {
+  display: flex;
+  gap: 0.75rem;
+  padding: 0.5rem 0;
+  transition: background-color 0.15s ease;
+}
+
+/* --- Journey leg: a "between-visits" connector, not a peer row --- */
+/* Legs read as transitions: lighter weight, no dot, and a rail whose height
+   grows with the duration of the leg. */
+.timeline-entry--journey {
+  display: block;
+  padding: 0;
+}
+
+/* Mirrors `.visit-row` so the time / rail / content columns line up
+   between visit rows and the connecting legs — gives the day a steady
+   left edge regardless of entry type. */
+.journey-leg,
+.gap-leg {
+  display: grid;
+  grid-template-columns: var(--tl-time-col) var(--tl-rail-col) minmax(0, 1fr) auto;
+  gap: var(--tl-col-gap);
+  align-items: center;
+  padding: 0.3rem var(--tl-pad-x);
+  font-size: 0.7rem;
+  color: var(--tl-text-2);
+  border-radius: 8px;
+  transition: background-color 0.15s ease;
+}
+
+/* Time is the vertical axis. `--tl-leg-extra` is set per row from the leg's
+   own duration, so the spine physically lengthens for a long drive and the
+   shape of the day becomes readable before a single number is. */
+.journey-leg,
+.gap-leg {
+  min-height: calc(1.5rem + var(--tl-leg-extra, 0px));
+}
+
+.journey-leg:hover {
+  background: oklch(var(--bc) / 0.05);
+  color: oklch(var(--bc) / 0.8);
+}
+
+.journey-leg__time,
+.gap-leg__time {
+  text-align: right;
+  font-size: 0.65rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--tl-text-2);
+}
+
+.journey-leg__summary,
+.gap-leg__summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.journey-leg__verb {
+  font-weight: 500;
+  color: oklch(var(--bc) / 0.72);
+}
+
+.journey-leg__sep {
+  color: oklch(var(--bc) / 0.45);
+}
+
+/* --- Gap: an interior stretch with no record at all ---
+   Solid rail means "we have this"; dotted means "we don't". That is the
+   whole distinction, and it is the one the old feed silently collapsed. */
+.timeline-entry--gap {
+  display: block;
+  padding: 0;
+}
+
+/* Reads at least as strongly as the solid rail — this segment is carrying
+   the message, so it must not be the faintest thing on the row. */
+.timeline-entry--gap::before {
+  width: 0;
+  background: none;
+  border-left: 2px dotted oklch(var(--bc) / 0.42);
+}
+
+.gap-leg__summary {
+  font-size: 0.65rem;
+  font-style: italic;
+  letter-spacing: 0.01em;
+  color: var(--tl-text-2);
+}
+
+.journey-leg__chevron {
+  width: 0.75rem;
+  height: 0.75rem;
+  flex-shrink: 0;
+  transition: transform 0.2s ease;
+  color: oklch(var(--bc) / 0.5);
+}
+
+/* Track info panel inside entry content.
+   Stacked above the spine: the row's rail is an absolutely-positioned
+   ::before, which paints over in-flow content, so an expanded card would
+   otherwise get a line drawn straight down its middle. The rail still enters
+   the top edge and leaves the bottom — the day continues, and this card is
+   detail hung off it. */
+.timeline-entry .track-info-panel {
+  position: relative;
+  z-index: 1;
+  margin-top: 0.375rem;
+}
+
+/* When the track-info panel is rendered inside a journey leg, push it to
+   span the full width of the day column (the connector indent shouldn't
+   apply to the expanded card). */
+.timeline-entry--journey .track-info-panel {
+  margin-left: 0;
+  margin-right: 0;
+}
+
+.track-info-chevron.expanded {
+  transform: rotate(180deg);
+}
+
+/* Compact track-info card — distance/speed/elevation render inline so the
+   card stays roughly two short rows even with all stats present. */
+.track-info-card {
+  margin-top: 0.375rem;
+  padding: 0.5rem 0.625rem;
+  border: 1px solid oklch(var(--bc) / 0.12);
+  border-radius: 0.5rem;
+  background: oklch(var(--b1));
+  font-size: 0.75rem;
+}
+
+.track-info-card__id {
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: oklch(var(--bc) / 0.45);
+  margin-bottom: 0.35rem;
+}
+
+.track-info-stats {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.875rem;
+}
+
+.track-info-stats__label {
+  color: oklch(var(--bc) / 0.55);
+  margin-right: 0.15rem;
+}
+
+.track-info-stats strong {
+  font-weight: 600;
+}
+
+.track-info-mode {
+  margin-left: auto;
+  padding: 0.05rem 0.4rem;
+  border: 1px solid oklch(var(--bc) / 0.25);
+  border-radius: 999px;
+  font-size: 0.65rem;
+  letter-spacing: 0.02em;
+  color: oklch(var(--bc) / 0.75);
+}
+
+.track-info-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-top: 0.4rem;
+  padding-top: 0.4rem;
+  border-top: 1px solid oklch(var(--bc) / 0.1);
+}
+
+.track-info-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  cursor: pointer;
+  font-size: 0.7rem;
+  color: oklch(var(--bc) / 0.8);
+  white-space: nowrap;
+}
+
+/* --- Empty state --- */
+.timeline-empty {
+  color: oklch(var(--bc) / 0.5);
+  font-size: 0.75rem;
+  padding: 0.5rem 0;
+}
+
+/* --- Responsive padding overrides --- */
+@media (max-width: 1024px) {
+  .tab-content[data-tab-content="timeline-feed"] {
+    margin: -20px;
+    padding: 12px;
+  }
+}
+
+@media (max-width: 768px) {
+  .tab-content[data-tab-content="timeline-feed"] {
+    margin: -16px -20px;
+    padding: 12px;
+  }
+}
+
+@media (max-width: 640px) {
+  .tab-content[data-tab-content="timeline-feed"] {
+    margin: -16px;
+    padding: 10px;
+  }
+}
+
+@media (max-width: 375px) {
+  .tab-content[data-tab-content="timeline-feed"] {
+    margin: -12px;
+    padding: 8px;
+  }
+}
+
+/* =========================================================================
+   Unified Timeline — calendar, visit rows, drawer, overlays
+   Introduced in Task 6 of the Unified Timeline plan. These styles back the
+   new Stimulus controller and the shared class contract consumed by the
+   server-rendered views and the map overlays.
+   ========================================================================= */
+
+/* --- Tab pane + filter row --- */
+/* Timeline tab fills the panel body and manages its own scroll — rail stays
+   in view while the main column (visit list) scrolls independently. */
+.tab-content[data-tab-content="timeline-feed"].active {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+/* Two-column layout: calendar/filter rail (260px) + visit list main.
+   No bottom padding so the day column reaches the panel edge; top + sides
+   keep the breathing room. */
+.timeline-tab-content {
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr);
+  gap: 1rem;
+  padding: 0.75rem 0.75rem 0;
+  align-items: start;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Collapse to single column when the panel gets narrow (≤1024px panel) */
+@media (max-width: 1024px) {
+  .timeline-tab-content {
+    grid-template-columns: 1fr;
+  }
+  .timeline-rail {
+    gap: 0.5rem;
+  }
+}
+
+/* --- Calendar grid (sits inside the 260px timeline-rail) --- */
+.timeline-calendar-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 1px;
+}
+
+/* Optimistic skeleton state — applied by `timeline-feed#previewMonth`
+   when the user clicks the prev/next month chevron. Removed implicitly
+   when the turbo_stream replaces the calendar frame with real data. */
+.timeline-calendar--loading .cal-cell {
+  opacity: 0.55;
+  cursor: progress;
+  transition: opacity 0.15s ease;
+}
+
+.timeline-calendar--loading .cal-cell:not(.cal-cell--selected) {
+  background: oklch(var(--bc) / 0.05);
+}
+
+.timeline-calendar-grid__weekday {
+  text-align: center;
+  font-size: 9px;
+  text-transform: uppercase;
+  color: oklch(var(--bc) / 0.5);
+  padding: 2px 0;
+}
+
+.cal-cell {
+  position: relative;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 500;
+  border: 0;
+  cursor: pointer;
+  background: transparent;
+  color: oklch(var(--bc));
+}
+
+.cal-cell:hover:not(.cal-cell--disabled) {
+  outline: 1px solid oklch(var(--bc) / 0.2);
+}
+
+.cal-cell--out-of-month {
+  color: oklch(var(--bc) / 0.25);
+}
+
+.cal-cell--disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.cal-cell--selected {
+  outline: 2px solid oklch(var(--p));
+  outline-offset: 1px;
+}
+
+/* Heat buckets — transparent through emerald-88%.
+   High-intensity cells switch to white text for contrast. */
+.heat-0 {
+  background: transparent;
+}
+.heat-1 {
+  background: rgba(34, 197, 94, 0.15);
+}
+.heat-2 {
+  background: rgba(34, 197, 94, 0.3);
+}
+.heat-3 {
+  background: rgba(34, 197, 94, 0.5);
+  color: white;
+}
+.heat-4 {
+  background: rgba(34, 197, 94, 0.7);
+  color: white;
+}
+.heat-5 {
+  background: rgba(34, 197, 94, 0.88);
+  color: white;
+}
+
+/* The day fills its column so the footer can anchor to the bottom (via
+   `margin-top: auto` on the footer) and the empty space below short days
+   gets reclaimed for at-a-glance rollup + quick day nav. */
+.timeline-day {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
+
+/* --- Day header / summary / bulk banner --- */
+.timeline-day-header {
+  padding: 0 0.5rem 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  border-bottom: 1px solid oklch(var(--bc) / 0.1);
+}
+
+/* Pinned to the bottom of the day column. Compact rollup of day stats
+   flanked by prev/next-day buttons, so users don't need to scroll back to
+   the header to switch days when they've scrolled to the bottom. */
+.timeline-day-footer {
+  margin-top: auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.6rem 0.5rem 0.4rem;
+  border-top: 1px dashed oklch(var(--bc) / 0.12);
+  color: oklch(var(--bc) / 0.7);
+}
+
+.timeline-day-rollup {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem 0.9rem;
+  margin: 0.25rem 0 0.5rem;
+  padding: 0.5rem 0.5rem;
+  font-size: 0.7rem;
+  font-variant-numeric: tabular-nums;
+  border-bottom: 1px dashed oklch(var(--bc) / 0.12);
+}
+
+.timeline-day-rollup > div {
+  display: flex;
+  align-items: baseline;
+  gap: 0.25rem;
+}
+
+.timeline-day-rollup dt {
+  color: oklch(var(--bc) / 0.5);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.6rem;
+  font-weight: 600;
+}
+
+.timeline-day-rollup dd {
+  margin: 0;
+  font-weight: 600;
+  color: oklch(var(--bc) / 0.85);
+}
+
+.timeline-day-header__nav {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.timeline-day-header__meta {
+  text-align: center;
+  font-size: 0.75rem;
+  color: oklch(var(--bc) / 0.6);
+}
+
+.timeline-day-summary {
+  font-size: 0.75rem;
+  color: oklch(var(--bc) / 0.7);
+  padding: 0 0.5rem;
+}
+
+.timeline-bulk-banner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.6rem 0.75rem;
+  background: rgba(245, 158, 11, 0.08);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+  border-radius: 8px;
+  font-size: 0.85rem;
+  margin: 0.5rem 0.25rem;
+  text-align: center;
+}
+
+.timeline-bulk-banner__text {
+  color: #d97706;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.timeline-bulk-banner__actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+}
+
+/* `button_to` wraps each button in a <form class="button_to"> which defaults
+   to block-level. Reset so the banner's flex layout works cleanly. */
+.timeline-bulk-banner__actions form.button_to {
+  display: inline-flex;
+  margin: 0;
+}
+
+/* --- Visit row --- */
+.visit-row {
+  display: grid;
+  /* minmax(0, 1fr) so the content column can shrink below its natural
+     content width — otherwise long place names push the row beyond the
+     panel and trigger horizontal scroll. */
+  grid-template-columns: var(--tl-time-col) var(--tl-rail-col) minmax(0, 1fr) auto;
+  gap: var(--tl-col-gap);
+  align-items: start;
+  /* No row border. Hairlines between every entry imposed table rhythm and
+     fought the spine; the rail and the whitespace do the separating now. */
+  padding: 0.55rem var(--tl-pad-x) 0.6rem;
+  border-radius: 8px;
+  cursor: pointer;
+  transition:
+    background-color 120ms ease,
+    box-shadow 120ms ease;
+}
+
+.visit-row:hover {
+  background-color: oklch(var(--bc) / 0.055);
+}
+
+.visit-row:focus-visible {
+  outline: 2px solid oklch(var(--p));
+  outline-offset: -2px;
+}
+
+.visit-row--selected {
+  background-color: oklch(var(--p) / 0.12);
+}
+
+/* Inline visit editor — spans the full row below the content columns.
+   Opaque and stacked above the spine, which runs the full height of the row
+   and would otherwise strike through the panel. */
+.visit-row__editor {
+  position: relative;
+  z-index: 1;
+  grid-column: 1 / -1;
+  min-width: 0;
+  margin-top: 8px;
+  padding: 10px 12px;
+  border: 1px solid oklch(var(--bc) / 0.1);
+  border-radius: 10px;
+  background: oklch(var(--b2));
+}
+
+.visit-editor__label {
+  display: block;
+  font-size: 0.625rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: oklch(var(--bc) / 0.45);
+  margin-bottom: 4px;
+}
+
+.visit-editor__name-form {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.visit-editor__foot {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+/* Icon-only: the row already says what it is, and the label was the widest
+   thing in a column that has to stay narrow. */
+.visit-edit-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  border: 1px solid oklch(var(--bc) / 0.15);
+  background: oklch(var(--b2));
+  color: oklch(var(--bc) / 0.7);
+  cursor: pointer;
+}
+
+.visit-edit-btn:hover,
+.visit-edit-btn:focus-visible,
+.visit-edit-btn[aria-expanded="true"] {
+  border-color: oklch(var(--in));
+  color: oklch(var(--in));
+}
+
+/* Search panel spans the full row so the input + results have room. */
+.visit-row__place-search {
+  grid-column: 1 / -1;
+  min-width: 0;
+}
+
+/* Belt + suspenders — ensure the content cell (and anything inside it like
+   the suggested picker) can shrink below intrinsic content width. */
+.visit-row__content {
+  min-width: 0;
+  justify-self: stretch;
+  text-align: left;
+}
+
+.visit-row__time {
+  text-align: right;
+  font-size: 0.7rem;
+  line-height: 1.45rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--tl-text-2);
+}
+
+.visit-row__all-day {
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Empty spacer; it only reserves the column. The dot positions itself
+   against the row so it lands exactly on the spine. */
+.visit-row__rail {
+  align-self: stretch;
+}
+
+/* The one line that has to be recognizable from across the room. */
+.visit-row__title {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 0.5rem;
+  font-size: 0.8125rem; /* 13px — compact; drops from the default ~16px */
+  font-weight: 600;
+  line-height: 1.45rem;
+  letter-spacing: -0.005em;
+  color: oklch(var(--bc) / 0.95);
+  text-align: left;
+}
+
+/* Wraps rather than truncates — a name the user typed themselves is never
+   the thing to cut off. Splitting the address out keeps this short anyway. */
+.visit-row__title > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.visit-row__title .place-link {
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.visit-row__title .place-link:hover {
+  text-decoration: underline;
+}
+
+.visit-row__meta {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  gap: 0.15rem 0.4rem;
+  margin-top: 1px;
+  font-size: 0.6875rem; /* 11px */
+  line-height: 1.35;
+  color: var(--tl-text-2);
+  text-align: left;
+}
+
+/* The rest of the geocoded string. Present, findable, and never competing
+   with the name above it. */
+.visit-row__address {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* How many fixes back this visit — a confidence signal, not a headline.
+   Ranked below the address by size, not by fading it out of readability. */
+.visit-row__points {
+  font-size: 0.625rem; /* 10px */
+  font-variant-numeric: tabular-nums;
+  color: var(--tl-text-2);
+}
+
+/* Trails the address rather than leading the point count, so a wrap leaves
+   the separator attached to the line it closes instead of orphaning a bullet
+   at the start of the next one. */
+.visit-row__address::after {
+  content: "·";
+  margin-left: 0.35rem;
+  color: oklch(var(--bc) / 0.45);
+}
+
+/* Duration sits opposite the arrival time, so the row is bracketed by when
+   and how long. Column width is reserved by the always-present duration, so
+   revealing the edit button on hover shifts nothing. */
+.visit-row__actions {
+  display: flex;
+  flex-direction: row-reverse;
+  align-items: center;
+  gap: 0.35rem;
+  line-height: 1.45rem;
+}
+
+.visit-row__duration {
+  font-size: 0.7rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--tl-text-2);
+}
+
+.visit-row .visit-edit-btn {
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.visit-row:hover .visit-edit-btn,
+.visit-row:focus-within .visit-edit-btn,
+.visit-row .visit-edit-btn[aria-expanded="true"] {
+  opacity: 1;
+}
+
+/* One neutral dot for every visit — detection status is not a UI state.
+   Positioned against the row, not the cell, so it lands dead centre on the
+   spine no matter how tall the row's content grows. */
+.visit-status-dot {
+  position: absolute;
+  left: var(--tl-rail-x);
+  top: var(--tl-dot-y);
+  transform: translate(-50%, -50%);
+  width: 9px;
+  height: 9px;
+  border-radius: 9999px;
+  background: var(--visit-marker);
+  box-shadow: 0 0 0 2px oklch(var(--b1));
+  transition:
+    background-color 120ms ease,
+    box-shadow 120ms ease;
+}
+
+/* Selection reads on the rail rather than as a coloured slab edge — the dot
+   is the thing the map is also highlighting, so it is what should change. */
+.visit-row--selected .visit-status-dot {
+  background: oklch(var(--p));
+  box-shadow:
+    0 0 0 2px oklch(var(--b1)),
+    0 0 0 4px oklch(var(--p) / 0.45);
+}
+
+/* Tag chips — background color applied inline by the view. */
+.tag-chip {
+  display: inline-block;
+  padding: 0 6px;
+  border-radius: 9999px;
+  font-size: 10px;
+  line-height: 1.6;
+  color: white;
+}
+
+/* Inside a row, a filled pill was the loudest thing on screen — louder than
+   the place name it annotates. The rail's filter chips stay pills because
+   there they are the control; here the tag is an annotation, so the user's
+   colour becomes a dot and the label joins the secondary tone. That also
+   sidesteps white-on-user-colour contrast, which we cannot predict. */
+.visit-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.625rem;
+  line-height: 1.35;
+  color: var(--tl-text-2);
+}
+
+.visit-tag__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  flex-shrink: 0;
+}
+
+/* Suggested picker styles live in maps_maplibre_suggested_picker.css. */
+
+/* Place drawer styles live in maps_maplibre_place_drawer.css. */
+
+/* --- Map overlays (scope + legend) ---
+   Hidden by default. Visible only when the map container sits in the
+   timeline-expanded state, which is toggled alongside the panel. */
+.timeline-map-overlay {
+  display: none;
+  position: absolute;
+  z-index: 500;
+  background: oklch(var(--b1) / 0.95);
+  backdrop-filter: blur(4px);
+  border: 1px solid oklch(var(--bc) / 0.15);
+  border-radius: 6px;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.75rem;
+}
+
+.maps-maplibre-container.panel-timeline-expanded .timeline-map-overlay {
+  display: block;
+}
+
+.timeline-map-overlay--scope {
+  top: 12px;
+  left: 12px;
+}
+
+.visit-row__check {
+  display: none;
+}
+
+.visit-row__check input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: oklch(var(--p));
+  cursor: pointer;
+}
+
+.visit-row {
+  position: relative;
+}
+
+[data-selection-mode="true"] .timeline-entries {
+  padding-left: 28px;
+}
+
+[data-selection-mode="true"] .visit-row__check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  position: absolute;
+  left: -22px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+[data-selection-mode="true"] .visit-row {
+  cursor: pointer;
+}
+
+[data-selection-mode="true"] .visit-row__actions,
+[data-selection-mode="true"] .visit-row__editor {
+  pointer-events: none;
+  opacity: 0.45;
+}
+
+.day-select-toggle {
+  margin-left: 8px;
+  font-size: 11px;
+  padding: 2px 8px;
+  border: 1px solid oklch(var(--bc) / 0.2);
+  border-radius: 6px;
+  background: transparent;
+  color: oklch(var(--bc) / 0.7);
+  cursor: pointer;
+}
+
+.day-select-toggle:hover {
+  background: oklch(var(--bc) / 0.05);
+  color: oklch(var(--bc));
+}
+
+[data-selection-mode="true"] .day-select-toggle {
+  background: oklch(var(--p) / 0.15);
+  border-color: oklch(var(--p) / 0.5);
+  color: oklch(var(--p));
+}
+
+.selection-bar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  margin: 0 0 8px 0;
+  background: oklch(var(--b2));
+  border: 1px solid oklch(var(--p) / 0.3);
+  border-radius: 8px;
+  font-size: 12px;
+  color: oklch(var(--bc));
+}
+
+.selection-bar[hidden] {
+  display: none;
+}
+
+.selection-bar__count {
+  font-weight: 600;
+}
+
+.selection-bar__actions {
+  display: flex;
+  flex-wrap: wrap;
+  row-gap: 6px;
+  column-gap: 8px;
+}
+
+.selection-bar__form {
+  display: inline-flex;
+  margin: 0;
+}
+
+.selection-bar__cancel,
+.selection-bar__action {
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+/* Icon-only exit control at the right end of the actions. */
+.selection-bar__cancel {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: oklch(var(--bc) / 0.6);
+}
+
+.selection-bar__cancel:hover,
+.selection-bar__cancel:focus-visible {
+  border-color: oklch(var(--bc) / 0.25);
+  color: oklch(var(--bc) / 0.9);
+}
+
+.selection-bar__action {
+  font-weight: 600;
+}
+
+.selection-bar__merge {
+  background: oklch(var(--p));
+  border: 1px solid oklch(var(--p));
+  color: oklch(var(--pc));
+}
+
+.selection-bar__delete {
+  background: oklch(var(--er));
+  border: 1px solid oklch(var(--er));
+  color: oklch(var(--erc));
+}
+
+.selection-bar__action:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ── Simplified segment legs (first expansion level of a journey) ── */
+.segment-ribbon {
+  display: flex;
+  height: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+  margin: 4px 0 8px;
+  background: oklch(var(--bc) / 0.08);
+}
+
+.segment-ribbon i {
+  display: block;
+  height: 100%;
+  min-width: 2px;
+}
+
+.segment-ribbon__gap {
+  background: transparent;
+  min-width: 0;
+}
+
+.segment-ribbon__uncertain {
+  background: repeating-linear-gradient(
+    135deg,
+    oklch(var(--bc) / 0.35) 0 4px,
+    oklch(var(--bc) / 0.12) 4px 8px
+  );
+}
+
+.segment-leg {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 3px 0;
+  font-size: 0.85rem;
+}
+
+.segment-stop {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+  font-size: 0.72rem;
+  font-style: italic;
+  color: oklch(var(--bc) / 0.45);
+}
+
+.segment-stop::before,
+.segment-stop::after {
+  content: "";
+  flex: 1;
+  border-top: 1px dashed oklch(var(--bc) / 0.15);
+}
+
+.segment-leg + .segment-leg,
+.segment-leg + .segment-stop,
+.segment-stop + .segment-leg {
+  border-top: 1px solid oklch(var(--bc) / 0.06);
+}
+
+.segment-leg__icon,
+.segment-row__icon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  align-self: center;
+  color: oklch(var(--bc) / 0.6);
+}
+
+.segment-leg__mode {
+  font-weight: 600;
+}
+
+/* The label is the control. It reads as text until you approach it, then a
+   dotted underline and a caret admit it is editable — the row never turns
+   into a form, and there is nothing to save. */
+.segment-leg__form {
+  display: contents;
+}
+
+.segment-leg__mode--editable {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  cursor: pointer;
+  border-bottom: 1px dashed oklch(var(--bc) / 0.28);
+  transition: border-color 120ms ease;
+}
+
+.segment-leg:hover .segment-leg__mode--editable,
+.segment-leg__mode--editable:focus-within {
+  border-bottom-color: oklch(var(--bc) / 0.7);
+}
+
+.segment-leg__caret {
+  width: 10px;
+  height: 10px;
+  flex-shrink: 0;
+  opacity: 0;
+  color: oklch(var(--bc) / 0.55);
+  transition: opacity 120ms ease;
+}
+
+.segment-leg:hover .segment-leg__caret,
+.segment-leg__mode--editable:focus-within .segment-leg__caret {
+  opacity: 1;
+}
+
+/* Stretched over the label so the text itself is the hit target. */
+.segment-leg__select {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.segment-leg__mode--editable:focus-within {
+  outline: 2px solid oklch(var(--p));
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+
+.segment-leg__nums {
+  font-size: 0.78rem;
+  color: oklch(var(--bc) / 0.6);
+  font-variant-numeric: tabular-nums;
+}
+
+.segment-leg__mid {
+  opacity: 0.4;
+  margin: 0 3px;
+}
+
+.segment-leg--neutral .segment-leg__mode {
+  font-weight: 500;
+  font-style: italic;
+  color: oklch(var(--bc) / 0.6);
+}
+
+/* Opening "All segments · edit" swaps the condensed list for the editable
+   one rather than stacking a second copy underneath it. When DisplayLegs
+   happens not to condense anything — no stationary rows, no short runs, all
+   confident — the two lists are the same segments twice over.
+   The ribbon deliberately survives: it indexes both views.
+   Without :has() support both lists show, which is the previous behaviour. */
+.track-segments:has(.segment-rawlist[open]) .segment-leg,
+.track-segments:has(.segment-rawlist[open]) .segment-stop {
+  display: none;
+}
+
+/* The toggle stays anchored at the bottom of the card in both states: the
+   rows it reveals are ordered above it, so opening does not yank the link
+   upward into the space the condensed list just vacated. */
+.segment-rawlist {
+  display: flex;
+  flex-direction: column;
+  margin-top: 8px;
+}
+
+.segment-rawlist > summary {
+  order: 1;
+}
+
+/* Belt and braces. Giving <details> a non-block display has historically let
+   engines render the collapsed content anyway; this states the collapse
+   outright rather than trusting each UA stylesheet to survive the change. */
+.segment-rawlist:not([open]) .segment-rawlist__rows {
+  display: none;
+}
+
+.segment-rawlist > summary {
+  list-style: none;
+  cursor: pointer;
+  font-size: 0.72rem;
+  color: oklch(var(--in));
+  user-select: none;
+}
+
+.segment-rawlist > summary::-webkit-details-marker {
+  display: none;
+}
+
+.segment-rawlist > summary:hover {
+  text-decoration: underline;
+}
+
+/* ── Day mode chips ── */
+.timeline-day-modes {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+
+.timeline-day-modes .mode-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: oklch(var(--b2));
+  border: 1px solid oklch(var(--bc) / 0.08);
+}
+
+/* Drawn icons, not emoji: these inherit currentColor and share the stroke
+   weight of every other icon on the panel. */
+.timeline-day-modes .mode-chip__icon {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  color: oklch(var(--bc) / 0.6);
+}
+
+.timeline-day-modes .mode-chip--muted {
+  font-weight: 500;
+  color: oklch(var(--bc) / 0.55);
+  background: transparent;
+}
+
+/* Confidence gating: medium-band suggestions render subdued; low-band ones
+   stay behind the per-day disclosure toggle (a day-level class, so the
+   search/filter `hidden` mechanics stay untouched). */
+.visit-row--subdued {
+  opacity: 0.55;
+}
+
+.timeline-day:not(.timeline-day--show-lowconf) .visit-row--lowconf {
+  display: none;
+}
+
+.timeline-lowconf-toggle {
+  display: block;
+  margin: 2px auto 8px;
+  padding: 2px 10px;
+  font-size: 0.72rem;
+  border-radius: 999px;
+  color: oklch(var(--bc) / 0.55);
+  background: transparent;
+  border: 1px dashed oklch(var(--bc) / 0.2);
+}
+
+.timeline-lowconf-toggle[aria-expanded="true"] {
+  color: oklch(var(--bc) / 0.8);
+  border-style: solid;
+}

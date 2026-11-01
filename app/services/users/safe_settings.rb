@@ -1,0 +1,460 @@
+# frozen_string_literal: true
+
+class Users::SafeSettings
+  attr_reader :settings
+
+  GATED_MAP_LAYERS = ['Heatmap', 'Fog of War', 'Scratch map'].freeze
+
+  MIN_MINUTES_BETWEEN_ROUTES = 1
+  MAX_MINUTES_BETWEEN_ROUTES = 1440
+
+  FOG_OF_WAR_MODES = %w[points hexagons].freeze
+
+  # Features a user can switch off in general settings, stored as
+  # "<feature>_enabled". A missing key means the feature is on.
+  TOGGLEABLE_FEATURES = %w[family achievements].freeze
+
+  def self.feature_enabled?(settings, feature)
+    ActiveModel::Type::Boolean.new.cast(settings["#{feature}_enabled"]) != false
+  end
+
+  DEFAULT_VALUES = {
+    'fog_of_war_meters' => 50,
+    'fog_of_war_threshold' => 50,
+    'fog_of_war_mode' => 'points',
+    'meters_between_routes' => 500,
+    'preferred_map_layer' => 'OpenStreetMap',
+    'speed_colored_routes' => false,
+    'points_rendering_mode' => 'raw',
+    'minutes_between_routes' => 30,
+    'time_threshold_minutes' => 30,
+    'merge_threshold_minutes' => 15,
+    'live_map_enabled' => true,
+    'route_opacity' => 0.6,
+    # Layer colors: route fallback matches Map v1's blue, track color matches
+    # Tracks::GeojsonSerializer::DEFAULT_COLOR, keep them in sync.
+    'route_color' => '#0000ff',
+    'track_color' => '#6366F1',
+    'immich_url' => nil,
+    'immich_api_key' => nil,
+    'immich_skip_ssl_verification' => false,
+    'photoprism_url' => nil,
+    'photoprism_api_key' => nil,
+    'photoprism_skip_ssl_verification' => false,
+    'airtrail_url' => nil,
+    'airtrail_api_key' => nil,
+    'airtrail_skip_ssl_verification' => false,
+    'airtrail_last_synced_at' => nil,
+    'teslamate_url' => nil,
+    'teslamate_username' => nil,
+    'teslamate_password' => nil,
+    'teslamate_api_token' => nil,
+    'teslamate_skip_ssl_verification' => false,
+    'teslamate_last_synced_at' => nil,
+    'teslamate_last_synced_url' => nil,
+    'teslamate_processing_pending' => false,
+    'teslamate_processing_pending_url' => nil,
+    'maps' => { 'distance_unit' => 'km' },
+    'visits_suggestions_enabled' => 'true',
+    'enabled_map_layers' => %w[Tracks Heatmap],
+    'maps_maplibre_style' => 'light',
+    'maps_maplibre_tiles_url' => nil,
+    'maps_maplibre_tiles_fallback' => false,
+    'maps_maplibre_custom_theme' => {
+      'base' => 'noir',
+      'tokens' => {
+        'bg' => '#000000', 'water' => '#0A0A0A', 'parks' => '#111111',
+        'buildings' => '#141414', 'railway' => '#808080', 'boundaries' => '#4D4D4D',
+        'road_motorway' => '#FFFFFF', 'road_primary' => '#E0E0E0',
+        'road_secondary' => '#B0B0B0', 'road_tertiary' => '#808080',
+        'road_residential' => '#505050', 'road_default' => '#808080'
+      }
+    },
+    'news_emails_enabled' => true,
+    'globe_projection' => true,
+    'supporter_email' => nil,
+    'supporter_github_username' => nil,
+    'show_supporter_badge' => true,
+    'min_minutes_spent_in_city' => 60,
+    # GPS noise filtering (Points::AnomalyFilter)
+    'gps_filtering_enabled' => true,
+    'gps_accuracy_filter_enabled' => false,
+    'gps_accuracy_threshold' => 100,
+    'timezone' => ENV.fetch('TIME_ZONE', 'UTC'),
+    'date_format' => 'auto',
+    'time_format' => 'auto',
+    'first_day_of_week' => 'monday',
+    'visit_radius_meters' => 100,
+    'visit_min_points' => 3,
+    'visit_min_duration_minutes' => 5,
+    'point_dragging_enabled' => false,
+    'points_tiled_rendering' => true,
+    'family_enabled' => true,
+    'achievements_enabled' => true
+  }.freeze
+
+  GPS_ACCURACY_THRESHOLD_MIN = 50
+  GPS_ACCURACY_THRESHOLD_MAX = 1000
+
+  def initialize(settings = {}, plan: nil)
+    settings = {} unless settings.is_a?(Hash)
+
+    @provided_settings = settings
+    @settings = DEFAULT_VALUES.deep_dup.deep_merge(settings)
+    @plan = plan
+  end
+
+  def config
+    {
+      fog_of_war_meters: fog_of_war_meters,
+      preferred_map_layer: preferred_map_layer,
+      time_threshold_minutes: time_threshold_minutes,
+      merge_threshold_minutes: merge_threshold_minutes,
+      live_map_enabled: live_map_enabled,
+      track_color: track_color,
+      immich_url: immich_url,
+      immich_api_key: immich_api_key,
+      photoprism_url: photoprism_url,
+      photoprism_api_key: photoprism_api_key,
+      airtrail_url: airtrail_url,
+      airtrail_api_key: airtrail_api_key,
+      maps: maps,
+      distance_unit: distance_unit,
+      visits_suggestions_enabled: visits_suggestions_enabled?,
+      fog_of_war_threshold: fog_of_war_threshold,
+      fog_of_war_mode: fog_of_war_mode,
+      enabled_map_layers: enabled_map_layers,
+      places_tag_filters: places_tag_filters,
+      maps_maplibre_style: maps_maplibre_style,
+      maps_maplibre_tiles_url: maps_maplibre_tiles_url,
+      maps_maplibre_tiles_fallback: maps_maplibre_tiles_fallback?,
+      maps_maplibre_custom_theme: maps_maplibre_custom_theme,
+      globe_projection: globe_projection,
+      enabled_transportation_modes: enabled_transportation_modes,
+      min_minutes_spent_in_city: min_minutes_spent_in_city,
+      gps_filtering_enabled: gps_filtering_enabled?,
+      gps_accuracy_filter_enabled: gps_accuracy_filter_enabled?,
+      gps_accuracy_threshold: gps_accuracy_threshold,
+      timezone: timezone,
+      visit_radius_meters: visit_radius_meters,
+      visit_min_points: visit_min_points,
+      visit_min_duration_minutes: visit_min_duration_minutes,
+      point_dragging_enabled: point_dragging_enabled?,
+      family_enabled: feature_enabled?('family'),
+      achievements_enabled: feature_enabled?('achievements')
+    }
+  end
+
+  def feature_enabled?(feature)
+    self.class.feature_enabled?(settings, feature)
+  end
+
+  # Preserve the public API contract for clients that still synchronize
+  # classic-renderer settings, without exposing those settings to MapLibre.
+  def api_config
+    config.merge(
+      meters_between_routes: meters_between_routes,
+      speed_colored_routes: speed_colored_routes,
+      points_rendering_mode: points_rendering_mode,
+      minutes_between_routes: minutes_between_routes,
+      route_opacity: route_opacity,
+      route_color: route_color,
+      speed_color_scale: speed_color_scale,
+      points_tiled_rendering: points_tiled_rendering?,
+      **date_time_preferences.to_h
+    )
+  end
+
+  def fog_of_war_meters
+    settings['fog_of_war_meters']
+  end
+
+  def meters_between_routes
+    meters = settings['meters_between_routes'].to_i
+    meters.positive? ? meters : DEFAULT_VALUES['meters_between_routes']
+  end
+
+  def preferred_map_layer
+    settings['preferred_map_layer']
+  end
+
+  def speed_colored_routes
+    settings['speed_colored_routes']
+  end
+
+  def points_rendering_mode
+    settings['points_rendering_mode']
+  end
+
+  def minutes_between_routes
+    minutes = settings['minutes_between_routes'].to_i
+    minutes = DEFAULT_VALUES['minutes_between_routes'] unless minutes.positive?
+
+    minutes.clamp(MIN_MINUTES_BETWEEN_ROUTES, MAX_MINUTES_BETWEEN_ROUTES)
+  end
+
+  def time_threshold_minutes
+    settings['time_threshold_minutes'].to_i.clamp(1, 1440)
+  end
+
+  def merge_threshold_minutes
+    settings['merge_threshold_minutes'].to_i
+  end
+
+  def live_map_enabled
+    settings['live_map_enabled']
+  end
+
+  def route_opacity
+    settings['route_opacity']
+  end
+
+  def route_color
+    settings['route_color']
+  end
+
+  def track_color
+    return settings['track_color'] if @provided_settings.key?('track_color')
+    return settings['route_color'] if Array(@provided_settings['enabled_map_layers']).include?('Routes')
+
+    settings['track_color']
+  end
+
+  def immich_url
+    settings['immich_url']
+  end
+
+  def immich_api_key
+    settings['immich_api_key']
+  end
+
+  def photoprism_url
+    settings['photoprism_url']
+  end
+
+  def photoprism_api_key
+    settings['photoprism_api_key']
+  end
+
+  def immich_skip_ssl_verification
+    ActiveModel::Type::Boolean.new.cast(settings['immich_skip_ssl_verification'])
+  end
+
+  def photoprism_skip_ssl_verification
+    ActiveModel::Type::Boolean.new.cast(settings['photoprism_skip_ssl_verification'])
+  end
+
+  def airtrail_url
+    settings['airtrail_url']
+  end
+
+  def airtrail_api_key
+    settings['airtrail_api_key']
+  end
+
+  def airtrail_skip_ssl_verification
+    ActiveModel::Type::Boolean.new.cast(settings['airtrail_skip_ssl_verification'])
+  end
+
+  def teslamate_url
+    settings['teslamate_url']
+  end
+
+  def teslamate_username
+    settings['teslamate_username']
+  end
+
+  def teslamate_password
+    settings['teslamate_password']
+  end
+
+  def teslamate_api_token
+    settings['teslamate_api_token']
+  end
+
+  def teslamate_skip_ssl_verification
+    ActiveModel::Type::Boolean.new.cast(settings['teslamate_skip_ssl_verification'])
+  end
+
+  def maps
+    m = settings['maps']
+    return m unless lite?
+
+    # Lite users cannot customize map layers or POI groups
+    m&.except('hidden_tile_categories', 'disabled_poi_groups') || m
+  end
+
+  def distance_unit
+    settings.dig('maps', 'distance_unit') || DEFAULT_VALUES.dig('maps', 'distance_unit')
+  end
+
+  def visits_suggestions_enabled?
+    ActiveModel::Type::Boolean.new.cast(settings['visits_suggestions_enabled']) == true
+  end
+
+  def speed_color_scale
+    settings['speed_color_scale']
+  end
+
+  def fog_of_war_threshold
+    settings['fog_of_war_threshold']
+  end
+
+  def fog_of_war_mode
+    value = settings['fog_of_war_mode'].to_s
+    FOG_OF_WAR_MODES.include?(value) ? value : 'points'
+  end
+
+  def enabled_map_layers
+    layers = Array(settings['enabled_map_layers']).dup
+    layers << 'Tracks' if layers.include?('Routes')
+    layers.delete('Routes')
+    layers.push('Places', 'Place boundaries') if layers.delete('Areas')
+    layers.uniq!
+    lite? ? layers - GATED_MAP_LAYERS : layers
+  end
+
+  def places_tag_filters
+    filters = settings['places_tag_filters']
+    return if filters.nil?
+
+    Array(filters).map { |value| value == 'untagged' ? value : value.to_i }
+  end
+
+  def maps_maplibre_style
+    settings['maps_maplibre_style']
+  end
+
+  def maps_maplibre_custom_theme
+    settings['maps_maplibre_custom_theme']
+  end
+
+  def maps_maplibre_tiles_url
+    settings['maps_maplibre_tiles_url']
+  end
+
+  def maps_maplibre_tiles_fallback?
+    ActiveModel::Type::Boolean.new.cast(settings['maps_maplibre_tiles_fallback']) || false
+  end
+
+  def globe_projection
+    return false if lite?
+
+    ActiveModel::Type::Boolean.new.cast(settings['globe_projection'])
+  end
+
+  def monthly_digest_emails_enabled?
+    fetch_with_legacy_fallback('monthly_digest_emails_enabled', 'digest_emails_enabled', default: true)
+  end
+
+  def yearly_digest_emails_enabled?
+    fetch_with_legacy_fallback('yearly_digest_emails_enabled', 'digest_emails_enabled', default: true)
+  end
+
+  def news_emails_enabled?
+    value = settings['news_emails_enabled']
+    return true if value.nil?
+
+    ActiveModel::Type::Boolean.new.cast(value)
+  end
+
+  def supporter_email
+    settings['supporter_email']
+  end
+
+  def supporter_github_username
+    settings['supporter_github_username']
+  end
+
+  def app_store_supporter?
+    ActiveModel::Type::Boolean.new.cast(settings['app_store_supporter']) == true
+  end
+
+  def show_supporter_badge?
+    value = settings['show_supporter_badge']
+    return true if value.nil?
+
+    ActiveModel::Type::Boolean.new.cast(value)
+  end
+
+  def enabled_transportation_modes
+    raw = settings['enabled_transportation_modes']
+    valid = Track::TRANSPORTATION_MODES.keys.map(&:to_s)
+    return valid if raw.nil? || (raw.respond_to?(:empty?) && raw.empty?)
+
+    intersection = Array(raw).map(&:to_s) & valid
+    intersection.presence || valid
+  end
+
+  def min_minutes_spent_in_city
+    (settings['min_minutes_spent_in_city'] || DEFAULT_VALUES['min_minutes_spent_in_city']).to_i
+  end
+
+  def timezone
+    settings['timezone'] || DEFAULT_VALUES['timezone']
+  end
+
+  def date_time_preferences
+    Users::DateTimePreferences.new(
+      date_format: settings['date_format'],
+      time_format: settings['time_format'],
+      first_day_of_week: settings['first_day_of_week']
+    )
+  end
+
+  def persisted_timezone
+    settings['timezone'].presence
+  end
+
+  def gps_filtering_enabled?
+    value = settings['gps_filtering_enabled']
+    return true if value.nil?
+
+    ActiveModel::Type::Boolean.new.cast(value)
+  end
+
+  # Off unless the user turns it on: the old slider saved a threshold on every
+  # settings save, so a stored value alone is not a choice to filter by it.
+  def gps_accuracy_filter_enabled?
+    ActiveModel::Type::Boolean.new.cast(settings['gps_accuracy_filter_enabled']) || false
+  end
+
+  def gps_accuracy_threshold
+    raw = settings['gps_accuracy_threshold'].presence || DEFAULT_VALUES['gps_accuracy_threshold']
+    raw.to_i.clamp(GPS_ACCURACY_THRESHOLD_MIN, GPS_ACCURACY_THRESHOLD_MAX)
+  end
+
+  def point_dragging_enabled?
+    ActiveModel::Type::Boolean.new.cast(settings['point_dragging_enabled']) || false
+  end
+
+  def points_tiled_rendering?
+    true
+  end
+
+  def visit_radius_meters
+    settings['visit_radius_meters'].to_i.clamp(5, 500)
+  end
+
+  def visit_min_points
+    settings['visit_min_points'].to_i.clamp(2, 20)
+  end
+
+  def visit_min_duration_minutes
+    raw = settings['visit_min_duration_minutes'] || DEFAULT_VALUES['visit_min_duration_minutes']
+    raw.to_i.clamp(1, 60)
+  end
+
+  private
+
+  def lite?
+    @plan&.to_sym == :lite
+  end
+
+  def fetch_with_legacy_fallback(new_key, legacy_key, default:)
+    return ActiveModel::Type::Boolean.new.cast(settings[new_key]) if settings.key?(new_key)
+    return ActiveModel::Type::Boolean.new.cast(settings[legacy_key]) if settings.key?(legacy_key)
+
+    default
+  end
+end

@@ -1,0 +1,855 @@
+import { translate } from "i18n"
+import * as maplibregl from "maplibre-gl"
+import { Toast } from "maps_maplibre/components/toast"
+import { PointDragGesture } from "maps_maplibre/editing/point_drag_gesture"
+import {
+  formatDistance,
+  formatSpeed,
+  minutesToDaysHoursMinutes,
+} from "maps_maplibre/utils/format_helpers"
+import {
+  escapeHtml,
+  formatTimestamp,
+} from "maps_maplibre/utils/geojson_transformers"
+import { isGatedPlan } from "maps_maplibre/utils/layer_gate"
+import { SettingsManager } from "maps_maplibre/utils/settings_manager"
+
+/**
+ * Handles map interaction events (clicks, info display)
+ */
+/**
+ * Format the coordinates a feature carries in its properties. Returns null when
+ * either is absent or blank, so the caller can fall back to the geometry.
+ * `Number("")` is 0 and finite, so a plain isFinite check is not enough.
+ */
+export function shouldShowPointPopup(properties = {}) {
+  if (properties.id == null) return false
+  return (properties.count ?? 1) <= 1
+}
+
+function storedCoordinates(properties) {
+  const { latitude, longitude } = properties
+  if (latitude == null || longitude == null) return null
+  if (latitude === "" || longitude === "") return null
+
+  const lat = Number(latitude)
+  const lon = Number(longitude)
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null
+
+  return `${lat.toFixed(6)}, ${lon.toFixed(6)}`
+}
+
+export class EventHandlers {
+  constructor(map, controller) {
+    this.map = map
+    this.controller = controller
+    this.selectedTrackFeature = null // Track selection state
+    this._trackSelectionGeneration = 0
+    this.trackMarkers = [] // Store segment markers for tracks
+    this._infoPanelDelegationSetup = false // Track if delegation is setup
+
+    // Bound handler for track point clicks — stored so the same reference can be
+    // used for both map.on() and map.off() during toggle cleanup
+    this._handleTrackPointClick = this.handleTrackPointClick.bind(this)
+    this._boundTrackPointsToggleChange =
+      this._handleTrackPointsToggleChange.bind(this)
+
+    this.pointDrag = new PointDragGesture(map, {
+      isEnabled: () => this._pointEditingEnabled(),
+      getEditor: () => this._mapEditor(),
+      isSinglePoint: shouldShowPointPopup,
+    })
+    this.pointDrag.attach()
+
+    this._boundOnSegmentModeChanged = this._onSegmentModeChanged.bind(this)
+    document.addEventListener(
+      "dawarich:segment-mode-changed",
+      this._boundOnSegmentModeChanged,
+    )
+  }
+
+  /**
+   * Tear down document-level listeners and DOM markers. Must be called from
+   * the parent Stimulus controller's `disconnect()` so Turbo navigations
+   * don't accumulate stale `dawarich:segment-mode-changed` listeners.
+   */
+  destroy() {
+    this.pointDrag?.detach()
+    if (this._boundOnSegmentModeChanged) {
+      document.removeEventListener(
+        "dawarich:segment-mode-changed",
+        this._boundOnSegmentModeChanged,
+      )
+      this._boundOnSegmentModeChanged = null
+    }
+    if (this.controller?.hasInfoDisplayTarget) {
+      this.controller.infoDisplayTarget.removeEventListener(
+        "change",
+        this._boundTrackPointsToggleChange,
+      )
+    }
+    this.teardownLayerInteractions()
+    this._clearTrackMarkers()
+  }
+
+  teardownLayerInteractions() {
+    this.pointDrag?.cancel()
+    this.map.off("click", "track-points", this._handleTrackPointClick)
+    this._trackSelectionGeneration += 1
+    this.selectedTrackFeature = null
+    this._clearTrackMarkers()
+  }
+
+  /** Handle a tile Point; address details load through the existing info UI. */
+  handlePointClick(e) {
+    // Check if the click is a follow-on event from a drag operation
+    const mapEditor = this.controller.layerManager.getLayer("map-editor")
+    if (mapEditor?.justDragged) return
+
+    const feature = e.features?.[0]
+    if (!feature) return
+    this.clearTrackSelection()
+    if (!shouldShowPointPopup(feature.properties)) {
+      if (feature.layer?.id === "points-mvt") {
+        const zoom = this.map.getZoom()
+        const nextZoom = Math.min(zoom + 2, this.map.getMaxZoom?.() ?? 22)
+        if (nextZoom > zoom) {
+          this.map.easeTo({ center: e.lngLat, zoom: nextZoom, duration: 350 })
+        } else {
+          this.controller.showInfo(
+            translate("map_info.location_point"),
+            `<p>${translate("map_info.overlapping_points", {
+              count: Number(feature.properties.count) || 2,
+            })}</p>`,
+          )
+        }
+      }
+      return
+    }
+    this._showPointFeature(feature)
+  }
+
+  _showPointFeature(feature) {
+    if (feature.layer?.id === "points-mvt" && this._pointEditingEnabled()) {
+      this._openPointEditor(feature).catch((error) => {
+        console.error("[EventHandlers] Failed to open point editor:", error)
+        Toast.error(translate("messages.failed_to_load_track_points"))
+      })
+    }
+
+    const pointId = feature.properties.id
+    const actions = pointId
+      ? [
+          {
+            type: "button",
+            handler: "handleDelete",
+            id: pointId,
+            entityType: "point",
+            label: translate("messages.delete"),
+          },
+        ]
+      : []
+
+    this.controller.showInfo(
+      translate("map_info.location_point"),
+      this._buildPointInfoContent(feature.properties, feature.geometry),
+      actions,
+    )
+  }
+
+  /**
+   * Handle anomaly point click — shows reason and timestamp in the info panel.
+   */
+  handleAnomalyClick(e) {
+    const feature = e.features[0]
+    const anomaliesLayer = this.controller.layerManager.getLayer("anomalies")
+    if (!anomaliesLayer) return
+
+    const content = anomaliesLayer.buildPopupContent(feature.properties)
+    this.controller.showInfo(translate("messages.anomaly_point"), content)
+  }
+
+  handleEditablePointClick(e) {
+    const mapEditor = this.controller.layerManager.getLayer("map-editor")
+    if (!mapEditor?.forEditing || mapEditor.justDragged) return
+    if (
+      this.map.getLayer("points-mvt") &&
+      this.map.queryRenderedFeatures(e.point, { layers: ["points-mvt"] })
+        .length > 0
+    )
+      return
+
+    const feature = e.features?.[0]
+    if (feature) this._showPointFeature(feature)
+  }
+
+  /**
+   * Handle track point click — injects point info into the existing track info panel.
+   * Suppresses the event if the user just finished dragging (justDragged flag).
+   */
+  handleTrackPointClick(e) {
+    // Check if the click is a follow-on event from a drag operation
+    const mapEditor = this.controller.layerManager.getLayer("map-editor")
+    if (mapEditor?.justDragged) return
+
+    const container = document.getElementById("track-point-info-container")
+    if (!container) return
+
+    const feature = e.features[0]
+    container.innerHTML = `
+      <div class="mt-3 pt-3 border-t border-base-300">
+        <div class="text-sm font-semibold mb-1">${translate("map_info.selected_point")}</div>
+        ${this._buildPointInfoContent(feature.properties, feature.geometry)}
+      </div>
+    `
+  }
+
+  /**
+   * Build HTML content for point info display (shared by regular and track points)
+   * Address is loaded asynchronously via a Turbo Frame.
+   * @param {Object} properties - GeoJSON feature properties
+   * @param {Object} geometry - GeoJSON geometry with coordinates
+   * @returns {string} HTML content string
+   * @private
+   */
+  _buildPointInfoContent(properties, geometry) {
+    const distanceUnit = this.controller.settings.distance_unit || "km"
+    // Prefer the stored values carried in the properties. A clicked feature's
+    // geometry comes back snapped to the tile grid, so reading coordinates off
+    // it shows a position that doesn't match the one in the points list.
+    const stored = storedCoordinates(properties)
+    const coords = geometry?.coordinates
+    const coordStr =
+      stored ??
+      (coords && coords.length >= 2
+        ? `${coords[1].toFixed(6)}, ${coords[0].toFixed(6)}`
+        : null)
+    const pointId = properties.id
+    const addressFrame = pointId
+      ? `<turbo-frame id="point-address-${pointId}" src="/points/${pointId}/address" loading="lazy"></turbo-frame>`
+      : ""
+    return `
+      <div class="space-y-2">
+        ${addressFrame}
+        ${coordStr ? `<div><span class="font-semibold">${translate("map_info.coordinates")}:</span> ${coordStr}</div>` : ""}
+        <div><span class="font-semibold">${translate("map_info.time")}:</span> ${formatTimestamp(properties.timestamp, this.controller.timezoneValue)}</div>
+        ${properties.battery ? `<div><span class="font-semibold">${translate("map_info.battery")}:</span> ${properties.battery}%</div>` : ""}
+        ${properties.altitude ? `<div><span class="font-semibold">${translate("map_info.altitude")}:</span> ${Math.round(properties.altitude)}m</div>` : ""}
+        ${properties.velocity ? `<div><span class="font-semibold">${translate("map_info.speed")}:</span> ${formatSpeed(properties.velocity * 3.6, distanceUnit)}</div>` : ""}
+      </div>
+    `
+  }
+
+  /**
+   * Handle visit click — opens the Timeline tab, selects the visit's day, and
+   * queues the visit for halo highlighting. Replaces the old Tools-tab flow
+   * (info panel + Edit button) which is gone with the unified timeline.
+   */
+  handleVisitClick(e) {
+    const properties = e.features[0].properties
+    const visitId = Number(properties.id)
+    const startedAt =
+      typeof properties.started_at === "string" ? properties.started_at : null
+    const date = startedAt ? startedAt.slice(0, 10) : null
+
+    document.dispatchEvent(
+      new CustomEvent("timeline:open-visit", {
+        detail: { visitId, date },
+      }),
+    )
+  }
+
+  /**
+   * Handle photo click
+   */
+  handlePhotoClick(e) {
+    const feature = e.features[0]
+    const properties = feature.properties
+
+    const content = `
+      <div class="space-y-2">
+        ${properties.photo_url ? `<img src="${escapeHtml(properties.photo_url)}" alt="${translate("map_info.photo")}" class="w-full rounded-lg mb-2" />` : ""}
+        ${properties.taken_at ? `<div><span class="font-semibold">${translate("map_info.taken")}:</span> ${formatTimestamp(properties.taken_at, this.controller.timezoneValue)}</div>` : ""}
+      </div>
+    `
+
+    this.controller.showInfo(translate("map_info.photo"), content)
+  }
+
+  /**
+   * Handle place click
+   */
+  handlePlaceClick(e) {
+    this.controller.placePanel.open(e.features[0].properties.id)
+  }
+
+  /**
+   * Create an emoji marker
+   * @param {String} emoji - The emoji to display
+   * @param {String} markerClass - CSS class for the marker (default: 'route-emoji-marker')
+   * @returns {maplibregl.Marker}
+   */
+  _createEmojiMarker(emoji, markerClass = "route-emoji-marker") {
+    const el = document.createElement("div")
+    el.className = markerClass
+    el.textContent = emoji
+    el.style.fontSize = "24px"
+    el.style.cursor = "pointer"
+    el.style.userSelect = "none"
+
+    return new maplibregl.Marker({ element: el, anchor: "center" })
+  }
+
+  /**
+   * Handle track click — opens the Timeline tab, navigates to the track's day,
+   * and expands the matching journey entry so the track's full details
+   * (distance, speed, elevation, replay, show-points toggle) are shown inline.
+   * Replaces the old Tools-tab flow.
+   */
+  handleTrackClick(e) {
+    // MapLibre dispatches a click to every intersected layer. A point drawn
+    // above a track must keep its selection instead of opening the track.
+    if (this.map.getLayer("points-mvt")) {
+      const pointFeatures = this.map.queryRenderedFeatures(e.point, {
+        layers: ["points-mvt"],
+      })
+      if (pointFeatures.length > 0) return
+    }
+
+    // Track points are part of a selected track and take the same priority.
+    if (this.map.getLayer("track-points")) {
+      const trackPointFeatures = this.map.queryRenderedFeatures(e.point, {
+        layers: ["track-points"],
+      })
+      if (trackPointFeatures.length > 0) return
+    }
+
+    const clickedFeature = e.features[0]
+    if (!clickedFeature) return
+
+    const properties = clickedFeature.properties
+    const fullFeature = clickedFeature
+    const generation = ++this._trackSelectionGeneration
+    this.selectedTrackFeature = fullFeature
+
+    // Keep the on-map highlight + segment visualization — those are visual
+    // feedback for the click itself, independent of the info surface.
+    try {
+      const tracksLayer = this.controller.layerManager.getLayer("tracks")
+      if (tracksLayer?.setSelectedTrack) {
+        tracksLayer.setSelectedTrack(fullFeature)
+      }
+    } catch (err) {
+      console.warn("[EventHandlers] Failed to highlight track:", err)
+    }
+    this._loadTrackSegments(properties.id, fullFeature, generation)
+
+    // Derive the day from the track's start. `start_at` comes from our own
+    // serializer as an ISO8601 string — safe to slice the date portion.
+    const startAt =
+      typeof properties.start_at === "string" ? properties.start_at : null
+    const date = startAt ? startAt.slice(0, 10) : null
+    const trackId = Number(properties.id)
+
+    document.dispatchEvent(
+      new CustomEvent("timeline:open-track", {
+        detail: { trackId, date, startAt },
+      }),
+    )
+  }
+
+  /**
+   * Load track segments from API (lazy loading)
+   * @private
+   */
+  async _loadTrackSegments(
+    trackId,
+    fullFeature,
+    generation = this._trackSelectionGeneration,
+  ) {
+    try {
+      const trackFeature = await this.controller.api.fetchTrackWithSegments(
+        trackId,
+        { ...this.controller.layerManager?.pointTileRange },
+      )
+      if (
+        generation !== this._trackSelectionGeneration ||
+        this.selectedTrackFeature !== fullFeature
+      )
+        return
+      if (!trackFeature) return
+
+      // The clicked MVT feature is clipped to a tile; segment visualization
+      // must use the canonical linestring returned by the focused fetch.
+      const displayFeature = trackFeature.geometry ? trackFeature : fullFeature
+      if (displayFeature !== fullFeature) {
+        this.selectedTrackFeature = displayFeature
+        const highlightLayer = this.controller.layerManager.getLayer("tracks")
+        if (highlightLayer?.setSelectedTrack) {
+          highlightLayer.setSelectedTrack(displayFeature)
+        }
+      }
+
+      let segments = []
+      try {
+        const props = trackFeature.properties
+        segments =
+          typeof props.segments === "string"
+            ? JSON.parse(props.segments)
+            : props.segments || []
+      } catch (err) {
+        console.warn("Failed to parse track segments:", err)
+      }
+
+      const tracksLayer = this.controller.layerManager.getLayer("tracks")
+      if (tracksLayer?.showSegments) {
+        tracksLayer.showSegments(displayFeature, segments)
+        tracksLayer.setSegmentHoverCallback((segmentIndex) => {
+          this._highlightSegmentOnMap(segmentIndex)
+          this._dispatchSegmentHover(trackId, segments[segmentIndex]?.id)
+        })
+        tracksLayer.setSegmentLeaveCallback(() => {
+          this._clearSegmentHighlight()
+          this._dispatchSegmentUnhover(trackId)
+        })
+      }
+
+      this._createTrackSegmentMarkers(trackId, displayFeature, segments)
+    } catch (error) {
+      if (generation !== this._trackSelectionGeneration) return
+      console.error("Failed to load track segments:", error)
+      Toast.error(translate("messages.failed_to_load_track_details"))
+    }
+  }
+
+  _dispatchSegmentHover(trackId, segmentId) {
+    if (!segmentId) return
+    document.dispatchEvent(
+      new CustomEvent("dawarich:segment-hover", {
+        detail: { trackId, segmentId },
+      }),
+    )
+  }
+
+  _dispatchSegmentUnhover(trackId) {
+    document.dispatchEvent(
+      new CustomEvent("dawarich:segment-unhover", {
+        detail: { trackId },
+      }),
+    )
+  }
+
+  _onSegmentModeChanged(event) {
+    const { trackId, segmentId, mode } = event.detail
+    const tracksLayer = this.controller.layerManager.getLayer("tracks")
+    if (tracksLayer?.updateSegmentMode) {
+      tracksLayer.updateSegmentMode(trackId, segmentId, mode)
+    }
+    this._updateSegmentMarkerEmoji(trackId, segmentId, mode)
+  }
+
+  _updateSegmentMarkerEmoji(trackId, segmentId, mode) {
+    const marker = this.trackMarkers?.find(
+      (m) => m.trackId === trackId && m.segmentId === segmentId,
+    )
+    if (!marker) return
+    if (typeof marker.setEmoji === "function") {
+      marker.setEmoji(this._modeEmoji(mode))
+    }
+  }
+
+  _modeEmoji(mode) {
+    return (
+      {
+        unknown: "❓",
+        stationary: "🛑",
+        walking: "🚶",
+        running: "🏃",
+        cycling: "🚴",
+        driving: "🚗",
+        bus: "🚌",
+        train: "🚆",
+        flying: "✈️",
+        boat: "⛵",
+        motorcycle: "\u{1F3CD}️",
+      }[mode] || "❓"
+    )
+  }
+
+  /**
+   * Show track info panel with basic info (segments loaded separately)
+   * @private
+   */
+  _showTrackInfoPanel(properties) {
+    const distanceUnit = this.controller.settings.distance_unit || "km"
+    const durationMinutes = Math.floor((properties.duration || 0) / 60)
+    const trackDistanceKm = (properties.distance || 0) / 1000
+
+    // Build content using template - data comes from our own trusted backend
+    const content = this._buildTrackInfoContent(
+      properties,
+      distanceUnit,
+      durationMinutes,
+      trackDistanceKm,
+    )
+
+    this.controller.showInfo(
+      translate("map_info.track_number", { id: properties.id }),
+      content,
+    )
+
+    // Set up the show points toggle handler (uses event delegation)
+    this._setupTrackPointsToggle()
+  }
+
+  /**
+   * Build track info panel HTML content
+   * Note: Data comes from our own backend API, not user input
+   * @private
+   */
+  _buildTrackInfoContent(
+    properties,
+    distanceUnit,
+    durationMinutes,
+    trackDistanceKm,
+  ) {
+    const showPointsToggle = `
+      <div class="form-control mt-3 pt-3 border-t border-base-300">
+        <label class="label cursor-pointer justify-start gap-3 py-1">
+          <input type="checkbox"
+                 id="track-points-toggle"
+                 class="toggle toggle-sm toggle-success"
+                 data-track-id="${properties.id}" />
+          <span class="label-text font-medium">${translate("map_info.show_points")}</span>
+        </label>
+        <p class="text-xs text-base-content/60 ml-10">${translate("map_info.show_points_help")}</p>
+      </div>
+    `
+
+    const replayButton = `
+      <div class="mt-3 pt-3 border-t border-base-300">
+        <button id="track-replay-button"
+                class="btn btn-sm btn-primary gap-2"
+                data-action="click->maps--maplibre#replayTrack"
+                data-track-start="${properties.start_at}">
+          <svg id="track-replay-play-icon" xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+            <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clip-rule="evenodd" />
+          </svg>
+          <svg id="track-replay-pause-icon" xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 hidden" viewBox="0 0 20 20" fill="currentColor">
+            <path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zM7 8a1 1 0 012 0v4a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v4a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd" />
+          </svg>
+          <span id="track-replay-label">${translate("replay.replay")}</span>
+        </button>
+      </div>
+    `
+
+    return `
+      <div class="space-y-2">
+        <div><span class="font-semibold">${translate("map_info.start")}:</span> ${formatTimestamp(properties.start_at, this.controller.timezoneValue)}</div>
+        <div><span class="font-semibold">${translate("map_info.end")}:</span> ${formatTimestamp(properties.end_at, this.controller.timezoneValue)}</div>
+        <div><span class="font-semibold">${translate("map_info.duration")}:</span> ${minutesToDaysHoursMinutes(durationMinutes)}</div>
+        <div><span class="font-semibold">${translate("map_info.distance")}:</span> ${formatDistance(trackDistanceKm, distanceUnit)}</div>
+        <div><span class="font-semibold">${translate("map_info.average_speed")}:</span> ${formatSpeed(properties.avg_speed || 0, distanceUnit)}</div>
+        ${properties.dominant_mode ? `<div><span class="font-semibold">${translate("map_info.mode")}:</span> ${escapeHtml(properties.dominant_mode_emoji)} ${escapeHtml(translate(`transportation_modes.${properties.dominant_mode}`))}</div>` : ""}
+        ${showPointsToggle}
+        <div id="track-point-info-container"></div>
+        ${replayButton}
+      </div>
+    `
+  }
+
+  /**
+   * Clear track selection
+   */
+  clearTrackSelection({ preserveEditor = false } = {}) {
+    if (!this.selectedTrackFeature) return
+
+    this._trackSelectionGeneration += 1
+    this.selectedTrackFeature = null
+
+    const tracksLayer = this.controller.layerManager.getLayer("tracks")
+    if (tracksLayer) {
+      // Clear selection highlight
+      if (tracksLayer.setSelectedTrack) {
+        tracksLayer.setSelectedTrack(null)
+      }
+      if (tracksLayer.hideSegments) {
+        tracksLayer.hideSegments()
+      }
+      // Clear hover callbacks
+      tracksLayer.setSegmentHoverCallback(null)
+      tracksLayer.setSegmentLeaveCallback(null)
+    }
+
+    if (preserveEditor) {
+      this.map.off("click", "track-points", this._handleTrackPointClick)
+      this._setMainPointsOpacity(1.0)
+    } else {
+      this.clearPointSelection()
+    }
+
+    // Clear segment markers
+    this._clearTrackMarkers()
+
+    // Close info panel
+    if (!preserveEditor) this.controller.closeInfo({ clearSelection: false })
+  }
+
+  clearPointSelection() {
+    this._clearTrackPointsLayer()
+    this._setMainPointsOpacity(1.0)
+  }
+
+  /**
+   * Set up the track points toggle handler using event delegation
+   * Uses delegation on info panel container to reliably catch toggle changes
+   * regardless of DOM timing
+   */
+  _setupTrackPointsToggle() {
+    // Only set up delegation once
+    if (this._infoPanelDelegationSetup) return
+
+    const infoDisplay = this.controller.infoDisplayTarget
+    if (!infoDisplay) return
+
+    // Use event delegation - listen for changes on the container
+    infoDisplay.addEventListener("change", this._boundTrackPointsToggleChange)
+
+    this._infoPanelDelegationSetup = true
+  }
+
+  async _handleTrackPointsToggleChange(event) {
+    if (event.target.id !== "track-points-toggle") return
+
+    const trackId = event.target.dataset.trackId
+    const enabled = event.target.checked
+    await this._toggleTrackPoints(trackId, enabled)
+  }
+
+  /**
+   * Toggle track points layer visibility
+   * @param {number} trackId - Track ID
+   * @param {boolean} enabled - Whether to show or hide points
+   */
+  async _toggleTrackPoints(trackId, enabled) {
+    if (enabled) {
+      // Dim the main points layer
+      this._setMainPointsOpacity(0.3)
+
+      const mapEditor = await this._mapEditor()
+      await mapEditor.selectTrack(trackId)
+
+      // Register click handler for track points (shows point info on click)
+      this.map.on("click", "track-points", this._handleTrackPointClick)
+    } else {
+      // Clear track points layer
+      this._clearTrackPointsLayer()
+
+      // Restore main points layer opacity
+      this._setMainPointsOpacity(1.0)
+    }
+  }
+
+  /**
+   * Clear the track points layer and remove its click handler
+   */
+  _clearTrackPointsLayer() {
+    // Remove the click handler before clearing the layer
+    this.map.off("click", "track-points", this._handleTrackPointClick)
+
+    this.controller.layerManager.getLayer("map-editor")?.clear()
+  }
+
+  async _mapEditor() {
+    let editor = this.controller.layerManager.getLayer("map-editor")
+    if (editor) return editor
+
+    const { MapEditor } = await import("maps_maplibre/editing/map_editor")
+    editor = new MapEditor(this.map, {
+      apiClient: this.controller.api,
+      layerManager: this.controller.layerManager,
+      editable: this._pointEditingEnabled(),
+      distanceUnit: this.controller.settings?.distance_unit || "km",
+      historyScope: () => ({
+        startAt: this.controller.startDateValue,
+        endAt: this.controller.endDateValue,
+      }),
+    })
+    this.controller.layerManager.registerLayer("map-editor", editor)
+    return editor
+  }
+
+  _pointEditingEnabled() {
+    return (
+      SettingsManager.getSetting("pointDraggingEnabled") === true &&
+      !isGatedPlan(this.controller?.userPlanValue)
+    )
+  }
+
+  canDragPoint(properties) {
+    return this.pointDrag.canDrag(properties)
+  }
+
+  async _openPointEditor(feature) {
+    const editor = await this._mapEditor()
+    if (feature.properties.track_id) {
+      await editor.selectTrack(feature.properties.track_id, {
+        forEditing: true,
+      })
+    } else {
+      editor.selectPoint(feature, { forEditing: true })
+    }
+  }
+
+  /**
+   * Set the opacity of the main points layer
+   * @param {number} opacity - Opacity value (0-1)
+   */
+  _setMainPointsOpacity(opacity) {
+    if (this.map.getLayer("points-mvt")) {
+      this.map.setPaintProperty("points-mvt", "circle-opacity", opacity)
+      this.map.setPaintProperty("points-mvt", "circle-stroke-opacity", opacity)
+    }
+  }
+
+  /**
+   * Create emoji markers at segment transition points
+   */
+  _createTrackSegmentMarkers(trackId, feature, segments) {
+    this._clearTrackMarkers()
+
+    if (feature?.geometry?.type !== "LineString") return
+    if (!segments || segments.length === 0) return
+
+    const coords = feature.geometry.coordinates
+    if (coords.length < 2) return
+
+    segments.forEach((segment) => {
+      const coordIndex = Math.min(segment.start_index || 0, coords.length - 1)
+      const coord = coords[coordIndex]
+      if (!coord) return
+
+      const marker = this._createEmojiMarker(
+        segment.emoji || "❓",
+        "track-emoji-marker",
+      )
+      marker.trackId = trackId
+      marker.segmentId = segment.id
+      marker.setLngLat(coord).addTo(this.map)
+      this.trackMarkers.push(marker)
+    })
+
+    const endCoord = coords[coords.length - 1]
+    const endMarker = this._createEmojiMarker("🏁", "track-emoji-marker")
+    endMarker.setLngLat(endCoord).addTo(this.map)
+    this.trackMarkers.push(endMarker)
+  }
+
+  /**
+   * Clear all track segment markers
+   */
+  _clearTrackMarkers() {
+    for (const marker of this.trackMarkers) {
+      marker.remove()
+    }
+    this.trackMarkers = []
+  }
+
+  /**
+   * Update track segment markers when track geometry changes
+   * Called after track recalculation to move emoji markers to new positions
+   * @param {Object} feature - The updated track GeoJSON feature
+   */
+  updateTrackMarkers(feature) {
+    if (!this.selectedTrackFeature) return
+    if (feature?.geometry?.type !== "LineString") return
+
+    // Parse segments from feature properties
+    let segments = []
+    try {
+      const props = feature.properties || {}
+      segments =
+        typeof props.segments === "string"
+          ? JSON.parse(props.segments)
+          : props.segments || []
+    } catch (err) {
+      console.warn("Failed to parse track segments for marker update:", err)
+      return
+    }
+
+    const trackId = feature.properties?.id
+    this._createTrackSegmentMarkers(trackId, feature, segments)
+  }
+
+  /**
+   * Zoom the map to fit a specific segment's bounds
+   * @param {Object} segment - Segment data with start_index and end_index
+   */
+  _zoomToSegment(segment) {
+    if (!this.selectedTrackFeature || !segment) return
+
+    const coords = this.selectedTrackFeature.geometry?.coordinates
+    if (!coords || coords.length < 2) return
+
+    const startIdx = Math.max(0, segment.start_index || 0)
+    const endIdx = Math.min(coords.length - 1, segment.end_index || startIdx)
+
+    // Extract coordinates for this segment
+    const segmentCoords = coords.slice(startIdx, endIdx + 1)
+    if (segmentCoords.length < 1) return
+
+    // Build bounds from segment coordinates
+    const bounds = new maplibregl.LngLatBounds()
+    segmentCoords.forEach((coord) => {
+      bounds.extend(coord)
+    })
+
+    // Fit map to segment bounds
+    this.map.fitBounds(bounds, {
+      padding: 80,
+      maxZoom: 17,
+      duration: 500,
+    })
+  }
+
+  /**
+   * Highlight a specific segment on the map
+   * @param {number} segmentIndex - Index of the segment to highlight
+   */
+  _highlightSegmentOnMap(segmentIndex) {
+    const tracksLayer = this.controller.layerManager.getLayer("tracks")
+    if (!tracksLayer) return
+
+    const segmentLayerId = tracksLayer.segmentLayerId
+    if (!this.map.getLayer(segmentLayerId)) return
+
+    // Increase opacity/width of hovered segment, dim others
+    this.map.setPaintProperty(segmentLayerId, "line-opacity", [
+      "case",
+      ["==", ["get", "segmentIndex"], segmentIndex],
+      1.0,
+      0.4,
+    ])
+    this.map.setPaintProperty(segmentLayerId, "line-width", [
+      "case",
+      ["==", ["get", "segmentIndex"], segmentIndex],
+      8,
+      4,
+    ])
+  }
+
+  /**
+   * Clear segment highlight on map
+   */
+  _clearSegmentHighlight() {
+    const tracksLayer = this.controller.layerManager.getLayer("tracks")
+    if (!tracksLayer) return
+
+    const segmentLayerId = tracksLayer.segmentLayerId
+    if (!this.map.getLayer(segmentLayerId)) return
+
+    // Reset to uniform appearance
+    this.map.setPaintProperty(segmentLayerId, "line-opacity", 0.9)
+    this.map.setPaintProperty(segmentLayerId, "line-width", 6)
+  }
+}

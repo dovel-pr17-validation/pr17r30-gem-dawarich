@@ -1,0 +1,82 @@
+# frozen_string_literal: true
+
+# Puma can serve each request in a thread from an internal thread pool.
+# The `threads` method setting takes two numbers: a minimum and maximum.
+# Any libraries that use thread pools should be configured to match
+# the maximum value specified for Puma. Default is set to 5 threads for minimum
+# and maximum; this matches the default thread size of Active Record.
+#
+threads_count = ENV.fetch('RAILS_MAX_THREADS', 5)
+threads threads_count, threads_count
+
+# Specifies the `worker_timeout` threshold that Puma will use to wait before
+# terminating a worker in development environments.
+#
+worker_timeout 3600 if ENV.fetch('RAILS_ENV', 'development') == 'development'
+
+# Specifies the `port` that Puma will listen on to receive requests; default is 3000.
+#
+port ENV.fetch('PORT', 3000)
+
+# Specifies the `environment` that Puma will run in.
+#
+environment ENV.fetch('RAILS_ENV', 'development')
+
+# Specifies the `pidfile` that Puma will use.
+pidfile ENV.fetch('PIDFILE', 'tmp/pids/server.pid')
+
+# Specifies the number of `workers` to boot in clustered mode.
+# Workers are forked web server processes. If using threads and workers together
+# the concurrency of the application would be max `threads` * `workers`.
+# Workers do not work on JRuby or Windows (both of which do not support
+# processes).
+#
+workers ENV.fetch('WEB_CONCURRENCY', 2)
+
+# Use the `preload_app!` method when specifying a `workers` number.
+# This directive tells Puma to first boot the application and load code
+# before forking the application. This takes advantage of Copy On Write
+# process behavior so workers use less memory.
+#
+preload_app!
+
+# Compact the preloaded heap before forking so workers share as many
+# copy-on-write pages as possible. Only runs in cluster mode (workers > 0).
+before_fork do
+  3.times { GC.start }
+  GC.compact
+end
+
+# Instance settings are cached per process. `preload_app!` above means a thread
+# started during preload lives in the master and dies at fork, so the subscriber
+# has to be started per worker or every request-serving process would keep a
+# stale snapshot until the next restart.
+before_worker_boot do
+  InstanceSettings::Notifier.start
+rescue StandardError => e
+  Rails.logger.warn("[InstanceSettings] subscriber failed to start: #{e.class}: #{e.message}")
+end
+
+# Allow puma to be restarted by `bin/rails restart` command.
+plugin :tmp_restart
+
+# Yabeda-Puma plugin: emits puma_* gauges (workers, backlog, pool_capacity, busy_threads).
+# activate_control_app is required by yabeda-puma-plugin (uses the control socket).
+if ENV['PROMETHEUS_EXPORTER_ENABLED'].to_s == 'true'
+  activate_control_app
+  plugin :yabeda
+end
+
+require_relative '../lib/dawarich/embedded_sidekiq'
+
+if Dawarich::EmbeddedSidekiq.enabled?
+  raise_exception_on_sigterm false
+  if ENV.fetch('WEB_CONCURRENCY', 2).to_i.positive?
+    before_worker_boot { Dawarich::EmbeddedSidekiq.start }
+    before_worker_shutdown { Dawarich::EmbeddedSidekiq.stop }
+  else
+    after_booted { Dawarich::EmbeddedSidekiq.start }
+    after_stopped { Dawarich::EmbeddedSidekiq.stop }
+    before_restart { Dawarich::EmbeddedSidekiq.stop }
+  end
+end

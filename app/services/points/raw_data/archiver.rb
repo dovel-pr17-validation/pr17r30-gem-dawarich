@@ -1,0 +1,331 @@
+# frozen_string_literal: true
+
+module Points
+  module RawData
+    # Service for archiving raw_data from points.
+    #
+    # Primary path: ArchiveUserJob calls this per-user with PK cursor (fast).
+    # Legacy path: archive_specific_month still works for rake tasks.
+    class Archiver
+      SAFE_ARCHIVE_LAG = 2.months
+      CHUNK_SIZE = 50_000
+      FLAG_BATCH_SIZE = 5_000
+
+      def initialize
+        @stats = { processed: 0, archived: 0, failed: 0 }
+      end
+
+      # Called by ArchiveUserJob — archives all eligible points for a user.
+      # Walks forward by PK, never scans the whole table.
+      # Each fetched batch is partitioned by the points' own UTC month so that
+      # archive year/month labels stay truthful for month-scoped restore/verify/clear.
+      def archive_user(user_id)
+        cutoff = SAFE_ARCHIVE_LAG.ago.to_i
+        cursor = 0
+
+        loop do
+          rows = Point
+                 .where(user_id: user_id, raw_data_archived: false)
+                 .where('timestamp < ?', cutoff)
+                 .where('id > ?', cursor)
+                 .where.not(raw_data: [nil, {}])
+                 .order(:id)
+                 .limit(CHUNK_SIZE)
+                 .pluck(:id, :timestamp)
+
+          break if rows.empty?
+
+          linked_before = @stats[:archived]
+
+          break unless archive_month_groups(user_id, rows)
+
+          next unless @stats[:archived] == linked_before
+
+          # Nothing in this batch could be linked, so re-reading it would spin
+          # forever. Step past it and keep draining the rest of the backlog.
+          cursor = rows.last.first
+
+          Rails.logger.warn(
+            "Skipping #{rows.size} unlinkable points for user #{user_id} (up to id #{cursor})"
+          )
+          Yabeda.dawarich_archive.operations_total.increment({ operation: 'archive', status: 'skipped' })
+        end
+
+        @stats
+      end
+
+      # Legacy: archive a specific month (used by rake tasks).
+      def archive_specific_month(user_id, year, month)
+        lock_key = "archive_points:#{user_id}:#{year}:#{month}"
+
+        lock_acquired = ActiveRecord::Base.with_advisory_lock(lock_key, timeout_seconds: 0) do
+          point_ids = find_month_point_ids(user_id, year, month)
+          next true if point_ids.empty?
+
+          # Process in chunks for large months
+          point_ids.each_slice(CHUNK_SIZE) do |chunk_ids|
+            @stats[:processed] += 1
+            @stats[:archived] += archive_chunk(user_id, chunk_ids, year, month)
+          end
+          true
+        end
+
+        raise "Could not acquire lock for #{lock_key} — archival already in progress" unless lock_acquired
+
+        @stats
+      end
+
+      private
+
+      # Returns false when any group failed, so the caller stops instead of
+      # re-fetching the same unarchived points forever. Sibling month groups in
+      # the same batch are independent and still attempted before stopping.
+      def archive_month_groups(user_id, rows)
+        batch_succeeded = true
+
+        rows.group_by { |_id, timestamp| utc_month(timestamp) }.each do |(year, month), group|
+          point_ids = group.map(&:first)
+
+          begin
+            archived_count = archive_chunk(user_id, point_ids, year, month)
+            @stats[:processed] += 1
+            @stats[:archived] += archived_count
+          rescue StandardError => e
+            @stats[:failed] += 1
+            Rails.logger.error(
+              "Failed to archive chunk for user #{user_id} " \
+              "(IDs #{point_ids.first}..#{point_ids.last}): #{e.message}"
+            )
+            ExceptionReporter.call(e, "Archive chunk failed for user #{user_id}")
+            batch_succeeded = false
+          end
+        end
+
+        batch_succeeded
+      end
+
+      def utc_month(timestamp)
+        time = Time.at(timestamp).utc
+        [time.year, time.month]
+      end
+
+      def archive_chunk(user_id, point_ids, year, month)
+        points = Point.where(id: point_ids).select(:id, :raw_data)
+
+        compressed = ChunkCompressor.new(points).compress
+        validate_count!(user_id, point_ids, compressed[:count], year, month)
+
+        encrypted = Encryption.encrypt(compressed[:data])
+
+        archive = nil
+        ActiveRecord::Base.transaction do
+          archive = create_archive_record(user_id, year, month, point_ids, encrypted, compressed)
+        end
+
+        # Full verification OUTSIDE transaction to avoid holding DB connection during I/O.
+        # Downloads the archive, decrypts, decompresses, and verifies point count + checksum.
+        verify_archive_full!(archive, point_ids)
+        archive.update!(verified_at: Time.current)
+
+        # Only flag points after verification succeeds, and only while their
+        # raw_data still matches the snapshot stored in this archive.
+        archived_count = flag_points_batched(point_ids, archive.id, compressed[:raw_data_checksums])
+
+        if archived_count.zero?
+          Rails.logger.warn("Discarding archive #{archive.id}: no points still matched the snapshot")
+          cleanup_failed_archive!(archive)
+
+          # cleanup_failed_archive! swallows its own errors, so confirm the
+          # discard happened rather than leaking an archive nothing links to.
+          if Points::RawDataArchive.exists?(archive.id)
+            raise StandardError, "Archive #{archive.id} linked no points and could not be discarded"
+          end
+
+          return 0
+        end
+
+        report_metrics(archive, archived_count, compressed)
+
+        Rails.logger.info(
+          "Archived chunk #{archive.id}: #{archived_count}/#{point_ids.size} points " \
+          "(IDs #{point_ids.first}..#{point_ids.last})"
+        )
+
+        archived_count
+      end
+
+      def find_month_point_ids(user_id, year, month)
+        start_of_month = Time.utc(year, month, 1).to_i
+        end_of_month = (Time.utc(year, month, 1) + 1.month).to_i
+
+        Point.where(user_id: user_id, raw_data_archived: false)
+             .where(timestamp: start_of_month...end_of_month)
+             .where.not(raw_data: [nil, {}])
+             .order(:id)
+             .pluck(:id)
+      end
+
+      def validate_count!(user_id, point_ids, actual_count, year, month)
+        expected_count = point_ids.size
+        return if actual_count == expected_count
+
+        Yabeda.dawarich_archive.count_mismatches_total.increment(
+          { year: year.to_s, month: month.to_s }
+        )
+        Yabeda.dawarich_archive.count_difference.set(
+          { user_id: user_id.to_s }, (expected_count - actual_count).abs
+        )
+
+        error_msg = "Archive count mismatch for user #{user_id}: " \
+                    "expected #{expected_count}, got #{actual_count}"
+        Rails.logger.error(error_msg)
+        ExceptionReporter.call(StandardError.new(error_msg), error_msg)
+        raise StandardError, error_msg
+      end
+
+      # Full round-trip verification: download → decrypt → decompress → parse → count + checksum.
+      # Runs OUTSIDE the transaction so network I/O doesn't hold DB connections.
+      # On failure, destroys the archive record and raises to prevent flagging points.
+      def verify_archive_full!(archive, point_ids)
+        raise StandardError, "Archive #{archive.id} has no attached file" unless archive.file.attached?
+
+        raw_content = archive.file.download
+        raise StandardError, "Archive #{archive.id} has zero-byte file" if raw_content.bytesize.zero?
+
+        # Verify content checksum (catches storage-layer corruption)
+        stored_checksum = archive.metadata&.dig('content_checksum')
+        if stored_checksum.present?
+          actual_checksum = Digest::SHA256.hexdigest(raw_content)
+          if actual_checksum != stored_checksum
+            cleanup_failed_archive!(archive)
+            raise StandardError,
+                  "Archive #{archive.id} content checksum mismatch"
+          end
+        end
+
+        # Decrypt and decompress to verify data integrity
+        decrypted = Encryption.decrypt_if_needed(raw_content, archive)
+        io = StringIO.new(decrypted)
+        gz = Zlib::GzipReader.new(io)
+        verified_ids = []
+        gz.each_line do |line|
+          data = JSON.parse(line)
+          verified_ids << data['id']
+        end
+        gz.close
+
+        # Verify point count matches
+        if verified_ids.size != point_ids.size
+          cleanup_failed_archive!(archive)
+          raise StandardError,
+                "Archive #{archive.id} point count mismatch: " \
+                "expected #{point_ids.size}, got #{verified_ids.size}"
+        end
+
+        # Verify point IDs checksum matches
+        verified_checksum = Digest::SHA256.hexdigest(verified_ids.sort.join(','))
+        expected_checksum = archive.point_ids_checksum
+        return if verified_checksum == expected_checksum
+
+        cleanup_failed_archive!(archive)
+        raise StandardError,
+              "Archive #{archive.id} point IDs checksum mismatch"
+      rescue Zlib::GzipFile::Error, JSON::ParserError, OpenSSL::Cipher::CipherError => e
+        cleanup_failed_archive!(archive)
+        raise StandardError,
+              "Archive #{archive.id} decrypt/decompress failed: #{e.message}"
+      end
+
+      def cleanup_failed_archive!(archive)
+        archive.file.purge if archive.file.attached?
+        archive.destroy!
+      rescue StandardError => e
+        Rails.logger.error("Failed to clean up archive #{archive.id}: #{e.message}")
+      end
+
+      def flag_points_batched(point_ids, archive_id, raw_data_checksums)
+        total_flagged = 0
+
+        point_ids.each_slice(FLAG_BATCH_SIZE) do |batch|
+          # Counted from the retry's return value: a batch that rolls back and
+          # replays must not add its flagged rows twice.
+          total_flagged += Point.with_write_contention_retry do
+            Point.transaction do
+              unchanged_ids = Point.raw_data_lock_order
+                                   .where(id: batch, raw_data_archived: false, raw_data_archive_id: nil)
+                                   .lock
+                                   .pluck(:id, :raw_data)
+                                   .filter_map do |id, raw_data|
+                checksum = Digest::SHA256.hexdigest(raw_data.to_json)
+                id if checksum == raw_data_checksums[id]
+              end
+
+              next 0 if unchanged_ids.empty?
+
+              Point.where(id: unchanged_ids, raw_data_archived: false, raw_data_archive_id: nil)
+                   .update_all(
+                     raw_data_archived: true,
+                     raw_data_archive_id: archive_id,
+                     lock_version: Arel.sql('lock_version')
+                   )
+            end
+          end
+        end
+
+        total_flagged
+      end
+
+      def create_archive_record(user_id, year, month, point_ids, encrypted, compressed)
+        chunk_number = Points::RawDataArchive
+                       .where(user_id: user_id, year: year, month: month)
+                       .maximum(:chunk_number).to_i + 1
+
+        chunk_filename = "#{format('%03d', chunk_number)}.jsonl.gz.enc"
+
+        archive = Points::RawDataArchive.create!(
+          user_id: user_id,
+          year: year,
+          month: month,
+          chunk_number: chunk_number,
+          point_count: point_ids.size,
+          point_ids_checksum: Digest::SHA256.hexdigest(point_ids.sort.join(',')),
+          archived_at: Time.current,
+          metadata: {
+            format_version: 2,
+            compression: 'gzip',
+            encryption: 'aes-256-gcm',
+            content_checksum: Digest::SHA256.hexdigest(encrypted),
+            min_point_id: point_ids.first,
+            max_point_id: point_ids.last,
+            expected_count: point_ids.size,
+            actual_count: compressed[:count]
+          }
+        )
+
+        storage_key = "raw_data_archives/#{user_id}/#{year}/" \
+                      "#{format('%02d', month)}/#{chunk_filename}"
+
+        archive.file.attach(
+          io: StringIO.new(encrypted),
+          filename: chunk_filename,
+          content_type: 'application/octet-stream',
+          key: storage_key
+        )
+
+        archive
+      end
+
+      def report_metrics(archive, count, compressed)
+        Yabeda.dawarich_archive.operations_total.increment({ operation: 'archive', status: 'success' })
+        Yabeda.dawarich_archive.points_total.increment({ operation: 'added' }, by: count)
+
+        return unless archive.file.attached?
+
+        Yabeda.dawarich_archive.size_bytes.measure({}, archive.file.blob.byte_size)
+        Yabeda.dawarich_archive.compression_ratio.measure(
+          {}, archive.file.blob.byte_size.to_f / compressed[:uncompressed_size]
+        )
+      end
+    end
+  end
+end

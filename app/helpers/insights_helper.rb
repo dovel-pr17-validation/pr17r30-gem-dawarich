@@ -1,0 +1,267 @@
+# frozen_string_literal: true
+
+module InsightsHelper
+  include CountryFlagHelper
+  include WeekStartHelper
+
+  def monthly_digest_title(digest)
+    return I18n.t('helpers.insights.monthly_digest') unless digest
+
+    month = I18n.l(Date.new(digest.year, digest.month, 1), format: :month_name)
+    I18n.t('helpers.insights.monthly_digest_title', month:, year: digest.year)
+  end
+
+  def monthly_digest_distance(digest, user)
+    return '0' unless digest
+
+    distance_unit = user.safe_settings.distance_unit
+    value = Stat.convert_distance(digest.distance, distance_unit).round
+    I18n.t(distance_unit == 'mi' ? 'units.miles' : 'units.kilometers', value: number_with_delimiter(value))
+  end
+
+  def monthly_digest_active_days(digest)
+    return '0/0' unless digest
+
+    "#{digest.active_days_count}/#{digest.days_in_month}"
+  end
+
+  def previous_month_link(year, month, available_months)
+    prev_date = Date.new(year, month, 1).prev_month
+
+    # Check if previous month exists in available months (same year only for simplicity)
+    return unless month > 1 && available_months.include?(prev_date.month)
+
+    details_insights_path(year: prev_date.year, month: prev_date.month)
+  end
+
+  def next_month_link(year, month, available_months)
+    next_date = Date.new(year, month, 1).next_month
+
+    # Check if next month exists in available months (same year only for simplicity)
+    return unless month < 12 && available_months.include?(next_date.month)
+
+    details_insights_path(year: next_date.year, month: next_date.month)
+  end
+
+  def weekly_pattern_chart_data(digest, user)
+    day_names = week_ordered(I18n.t('calendar.abbreviated_weekdays'))
+    return day_names.map { |day| [day, 0] } unless digest
+
+    pattern = digest.weekly_pattern
+    return day_names.map { |day| [day, 0] } unless pattern.is_a?(Array) && pattern.size == 7
+
+    distance_unit = user.safe_settings.distance_unit
+    day_names.zip(week_ordered(pattern)).map do |day, distance_meters|
+      [day, Stat.convert_distance(distance_meters || 0, distance_unit).round]
+    end
+  end
+
+  def weekday_strip(monday_first_distances)
+    week_ordered(I18n.t('date.abbr_day_names').rotate.zip(monday_first_distances))
+  end
+
+  def top_locations_from_digest(digest, limit = 3)
+    return [] unless digest
+
+    toponyms = digest.toponyms
+    return [] unless toponyms.is_a?(Array)
+
+    locations = []
+    toponyms.each do |toponym|
+      next unless toponym.is_a?(Hash)
+
+      country = toponym['country']
+      cities = toponym['cities']
+
+      next unless cities.is_a?(Array) && cities.any?
+
+      cities.each do |city|
+        next unless city.is_a?(Hash)
+
+        city_name = city['city']
+        stayed_for = city['stayed_for'].to_i
+        locations << {
+          name: "#{city_name}, #{country_code(country)}",
+          minutes: stayed_for
+        }
+      end
+    end
+
+    # Sort by minutes and take top N
+    locations.sort_by { |l| -l[:minutes] }.first(limit)
+  end
+
+  def format_location_time(minutes)
+    total_minutes = minutes.to_i
+    return I18n.t('helpers.insights.minute_count', count: 0) if minutes.nil? || total_minutes.zero?
+
+    # ActiveSupport::Duration#parts decomposes into months/weeks/days/etc., so
+    # `parts[:days]` only returns the day component within a month (max ~6) and
+    # silently truncates large totals (e.g. 133 actual days renders as "4 days").
+    # Compute the total day/hour count directly from the minutes input instead.
+    days = total_minutes / 1440
+    return I18n.t('helpers.insights.day_count', count: days) if days >= 1
+
+    hours = total_minutes / 60
+    return I18n.t('helpers.insights.hour_count', count: hours) if hours >= 1
+
+    I18n.t('helpers.insights.minute_count', count: total_minutes)
+  end
+
+  def first_time_visits_from_digest(digest)
+    return { countries: [], cities: [] } unless digest
+
+    {
+      countries: digest.first_time_countries || [],
+      cities: digest.first_time_cities || []
+    }
+  end
+
+  def generate_travel_insight(time_of_day, day_of_week, seasonality)
+    Insights::TravelInsightGenerator.new(
+      time_of_day: time_of_day,
+      day_of_week: day_of_week,
+      seasonality: seasonality
+    ).call
+  end
+
+  # Format activity breakdown duration from seconds to human-readable hours
+  def format_activity_hours(seconds)
+    return I18n.t('units.hours_compact', value: 0) if seconds.nil? || seconds.to_i.zero?
+
+    hours = (seconds.to_i / 3600.0).round(1)
+    if hours >= 1
+      I18n.t('units.hours_compact', value: hours.to_i == hours ? hours.to_i : hours)
+    else
+      minutes = (seconds.to_i / 60.0).round
+      I18n.t('units.minutes_word_compact', value: minutes)
+    end
+  end
+
+  # Calculate activity statistics from activity_breakdown hash
+  # Returns: { walking: hours, cycling: hours, driving: hours, transport: hours, active: hours, stationary: hours }
+  def activity_statistics(activity_breakdown)
+    return empty_activity_stats if activity_breakdown.blank?
+
+    stats = empty_activity_stats
+    activity_breakdown.each { |mode, data| accumulate_activity_stat(stats, mode.to_s, data['duration'].to_i) }
+    stats
+  end
+
+  def accumulate_activity_stat(stats, mode, duration)
+    case mode
+    when 'walking', 'running', 'cycling'
+      stats[mode.to_sym] = duration
+      stats[:active] += duration
+    when 'stationary'
+      stats[:stationary] = duration
+    when 'driving', 'bus', 'train', 'flying', 'boat', 'motorcycle'
+      stats[:driving] = duration if mode == 'driving'
+      stats[:transport] += duration
+    end
+  end
+
+  def empty_activity_stats
+    { walking: 0, cycling: 0, running: 0, driving: 0, transport: 0, active: 0, stationary: 0 }
+  end
+
+  # Calculate activity ratio as "1:X" format (active vs sedentary)
+  def activity_ratio(active_seconds, sedentary_seconds)
+    return I18n.t('common.not_available') if active_seconds.to_i.zero? || sedentary_seconds.to_i.zero?
+
+    ratio = sedentary_seconds.to_f / active_seconds
+    "1:#{ratio.round}"
+  end
+
+  # Check if activity breakdown has meaningful data
+  def activity_breakdown_present?(activity_breakdown)
+    return false if activity_breakdown.blank?
+
+    activity_breakdown.values.sum { |v| v['duration'].to_i }.positive?
+  end
+
+  # Activity heatmap helpers
+  def calculate_activity_level(distance, levels)
+    return 0 if distance.nil? || distance.to_i.zero?
+
+    distance = distance.to_i
+    return 4 if distance >= levels[:p90]
+    return 3 if distance >= levels[:p75]
+    return 2 if distance >= levels[:p50]
+    return 1 if distance >= levels[:p25]
+
+    1 # Any activity is at least level 1
+  end
+
+  def format_heatmap_distance(meters, unit)
+    return '0' if meters.nil? || meters.to_i.zero?
+
+    converted = Stat.convert_distance(meters.to_i, unit)
+    if converted < 1
+      if unit == 'mi'
+        feet = (converted * 5280).round
+        I18n.t('units.feet', value: feet)
+      else
+        I18n.t('units.meters', value: meters.to_i)
+      end
+    else
+      I18n.t(unit == 'mi' ? 'units.miles' : 'units.kilometers', value: converted.round(1))
+    end
+  end
+
+  def heatmap_week_columns(year, week_start: self.week_start)
+    start_of_grid = Date.new(year, 1, 1).beginning_of_week(week_start)
+    end_of_grid = Date.new(year, 12, 31).end_of_week(week_start)
+
+    weeks = []
+    current_week_start = start_of_grid
+
+    while current_week_start <= end_of_grid
+      weeks << current_week_start
+      current_week_start += 7
+    end
+
+    weeks
+  end
+
+  def heatmap_month_labels(weeks, year)
+    labels = []
+    current_month = nil
+
+    weeks.each_with_index do |week_start, index|
+      # Get the date that falls within the target year for this week
+      week_date = week_start
+      7.times do |i|
+        check_date = week_start + i
+        if check_date.year == year
+          week_date = check_date
+          break
+        end
+      end
+
+      next unless week_date.year == year
+
+      if week_date.month != current_month
+        current_month = week_date.month
+        labels << { index: index, name: I18n.l(Date.new(year, current_month, 1), format: :abbreviated_month_name) }
+      end
+    end
+
+    labels
+  end
+
+  def most_recent_active_date(daily_data)
+    return nil if daily_data.blank?
+
+    daily_data
+      .select { |_date_key, distance| distance.to_i.positive? }
+      .keys
+      .max
+  end
+
+  private
+
+  def country_code(country_name)
+    country_to_code(country_name) || country_name&.first(2)&.upcase || '??'
+  end
+end

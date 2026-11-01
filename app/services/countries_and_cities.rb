@@ -1,0 +1,126 @@
+# frozen_string_literal: true
+
+class CountriesAndCities
+  CountryData = Struct.new(:country, :cities, keyword_init: true)
+  CityData = Struct.new(:city, :points, :timestamp, :stayed_for, keyword_init: true)
+
+  FLYOVER_VELOCITY_THRESHOLD_KMH = 500
+  MS_TO_KMH = 3.6
+  BRIDGE_CAP_SECONDS = Visits::Detection::Policy::BRIDGE_CAP_S
+  MIN_TRANSIT_RUN_POINTS = 2
+
+  def self.not_flyover_sql(column = 'velocity')
+    <<~SQL.squish
+      (CASE
+        WHEN #{column} ~ '^[[:space:]]*[+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?[[:space:]]*$'
+          THEN #{column}::double precision
+        ELSE 0
+      END * #{MS_TO_KMH}) <= #{FLYOVER_VELOCITY_THRESHOLD_KMH}
+    SQL
+  end
+
+  def initialize(points, min_minutes_spent_in_city: 60)
+    @points = points
+    @min_minutes_spent_in_city = min_minutes_spent_in_city
+  end
+
+  def call
+    country_runs = presence_runs.group_by { |run| run[:country] }
+    countries_present.map do |country|
+      CountryData.new(country: country, cities: build_cities(country_runs.fetch(country, [])))
+    end
+  end
+
+  private
+
+  attr_reader :points, :min_minutes_spent_in_city
+
+  def ordered_points
+    @ordered_points ||= points.sort_by { |point| [point[:timestamp], point[:id].to_i] }
+  end
+
+  def countries_present
+    ordered_points.filter_map do |point|
+      canonical_country_name(point) unless flyover?(point) || point[:country_name].blank?
+    end.uniq
+  end
+
+  def presence_runs
+    segments_between_transits.flat_map { |segment| runs_within(segment) }
+  end
+
+  def segments_between_transits
+    ordered_points
+      .chunk { |point| flyover?(point) }
+      .each_with_object([[]]) do |(flyover, chunk), segments|
+        if !flyover
+          segments.last.concat(chunk)
+        elsif chunk.size >= MIN_TRANSIT_RUN_POINTS
+          segments << []
+        end
+      end
+  end
+
+  def runs_within(segment)
+    segment
+      .reject { |point| point[:country_name].blank? || point[:city].blank? }
+      .slice_when { |previous, current| separate_runs?(previous, current) }
+      .map { |run_points| build_run(run_points) }
+  end
+
+  def separate_runs?(previous, current)
+    previous[:city] != current[:city] ||
+      canonical_country_name(previous) != canonical_country_name(current) ||
+      (current[:timestamp] - previous[:timestamp]) > BRIDGE_CAP_SECONDS
+  end
+
+  def build_run(run_points)
+    timestamps = run_points.map { |point| point[:timestamp] }
+
+    {
+      country: canonical_country_name(run_points.first),
+      city: run_points.first[:city],
+      points: run_points.size,
+      last_timestamp: timestamps.max,
+      duration_seconds: timestamps.max - timestamps.min
+    }
+  end
+
+  def build_cities(country_runs)
+    country_runs
+      .group_by { |run| run[:city] }
+      .filter_map { |city, city_runs| build_city_data(city, city_runs) }
+  end
+
+  def build_city_data(city, city_runs)
+    return nil if city.blank?
+
+    duration = city_runs.sum { |run| run[:duration_seconds] } / 60
+    return nil if duration < min_minutes_spent_in_city
+
+    CityData.new(
+      city: city,
+      points: city_runs.sum { |run| run[:points] },
+      timestamp: city_runs.map { |run| run[:last_timestamp] }.max,
+      stayed_for: duration
+    )
+  end
+
+  def flyover?(point)
+    (point[:velocity].to_f * MS_TO_KMH) > FLYOVER_VELOCITY_THRESHOLD_KMH
+  end
+
+  def canonical_country_name(point)
+    country_id = point[:country_id]
+    return point[:country_name] if country_id.blank?
+
+    country_names_by_id[country_id] || point[:country_name]
+  end
+
+  def country_names_by_id
+    @country_names_by_id ||= begin
+      ids = points.filter_map { |point| point[:country_id] }.uniq
+      ids.any? ? Country.where(id: ids).pluck(:id, :name).to_h : {}
+    end
+  end
+end

@@ -1,0 +1,403 @@
+# frozen_string_literal: true
+
+require 'rails_helper'
+
+RSpec.describe 'settings/general', type: :request do
+  include ActiveSupport::Testing::TimeHelpers
+
+  context 'when user is authenticated' do
+    let!(:user) { create(:user, settings: {}) }
+
+    before do
+      sign_in user
+    end
+
+    describe 'GET /index' do
+      before do
+        allow(ENV).to receive(:[]).and_call_original
+        allow(ENV).to receive(:[]).with('SMTP_SERVER').and_return('smtp.example.com')
+      end
+
+      it 'returns a success response' do
+        get settings_general_index_url
+
+        expect(response).to be_successful
+      end
+
+      context 'when the user bought self-hosted Pro in the mobile app' do
+        before do
+          allow(DawarichSettings).to receive(:self_hosted?).and_return(true)
+          user.update!(settings: { 'app_store_supporter' => true })
+        end
+
+        it 'names the Dawarich app as the supporter platform' do
+          get settings_general_index_url
+
+          expect(response.body).to include('Thank you for supporting Dawarich via Dawarich app!')
+          expect(response.body).not_to include('translation_missing')
+        end
+      end
+
+      it 'renders both digest toggles and the email-digests anchor' do
+        get settings_general_index_url
+
+        expect(response.body).to include('id="email-digests"')
+        expect(response.body).to include('name="monthly_digest_emails_enabled"')
+        expect(response.body).to include('name="yearly_digest_emails_enabled"')
+      end
+
+      it 'renders the date and time selects with the saved values and example labels' do
+        user.update!(
+          settings: { 'date_format' => 'dd.mm.yyyy', 'time_format' => '12h', 'first_day_of_week' => 'sunday' }
+        )
+
+        travel_to(Time.zone.local(2026, 10, 24, 14, 5)) { get settings_general_index_url }
+
+        page = Nokogiri::HTML(response.body)
+        date_select = page.at_css('select[name="date_format"]')
+        expect(date_select.at_css('option[selected]')['value']).to eq('dd.mm.yyyy')
+        expect(date_select.css('option').to_h { |option| [option['value'], option.text.strip] })
+          .to include('auto' => 'Automatic (Oct 24, 2026)', 'dd.mm.yyyy' => '24.10.2026', 'yyyy-mm-dd' => '2026-10-24')
+        expect(page.at_css('select[name="time_format"] option[selected]')['value']).to eq('12h')
+        expect(page.at_css('select[name="first_day_of_week"] option[selected]')['value']).to eq('sunday')
+      end
+
+      it 'shows a not-configured notice instead of preferences when SMTP is unset' do
+        allow(ENV).to receive(:[]).with('SMTP_SERVER').and_return(nil)
+
+        get settings_general_index_url
+
+        expect(response.body).to include('Email sending via SMTP is not configured')
+        expect(response.body).to include('https://dawarich.app/docs/self-hosting/configuration/smtp/')
+        expect(response.body).not_to include('name="monthly_digest_emails_enabled"')
+        expect(response.body).not_to include('name="news_emails_enabled"')
+      end
+    end
+
+    describe 'PATCH /update' do
+      it 'disables news emails setting' do
+        patch settings_general_path, params: { news_emails_enabled: '0' }
+
+        expect(response).to redirect_to(settings_general_index_path)
+        expect(user.reload.settings['news_emails_enabled']).to eq(false)
+      end
+
+      it 'enables news emails setting' do
+        patch settings_general_path, params: { news_emails_enabled: '1' }
+
+        expect(response).to redirect_to(settings_general_index_path)
+        expect(user.reload.settings['news_emails_enabled']).to eq(true)
+      end
+
+      it 'updates monthly_digest_emails_enabled independently' do
+        patch settings_general_path, params: { monthly_digest_emails_enabled: '0' }
+
+        expect(response).to redirect_to(settings_general_index_path)
+        expect(user.reload.settings['monthly_digest_emails_enabled']).to eq(false)
+      end
+
+      it 'updates yearly_digest_emails_enabled independently' do
+        patch settings_general_path, params: { yearly_digest_emails_enabled: '0' }
+
+        expect(response).to redirect_to(settings_general_index_path)
+        expect(user.reload.settings['yearly_digest_emails_enabled']).to eq(false)
+      end
+
+      it 'updates both monthly and yearly digest settings' do
+        patch settings_general_path, params: {
+          monthly_digest_emails_enabled: '1',
+          yearly_digest_emails_enabled: '0'
+        }
+
+        expect(response).to redirect_to(settings_general_index_path)
+        expect(user.reload.settings['monthly_digest_emails_enabled']).to eq(true)
+        expect(user.reload.settings['yearly_digest_emails_enabled']).to eq(false)
+      end
+
+      context 'when the user still has the legacy digest_emails_enabled key' do
+        let!(:user) { create(:user, settings: { 'digest_emails_enabled' => false }) }
+
+        it 'removes the legacy key once a new digest key is written, leaving only the new key' do
+          patch settings_general_path, params: { monthly_digest_emails_enabled: '0' }
+
+          settings = user.reload.settings
+          expect(settings).to have_key('monthly_digest_emails_enabled')
+          expect(settings['monthly_digest_emails_enabled']).to eq(false)
+          expect(settings).not_to have_key('digest_emails_enabled')
+        end
+
+        it 'keeps the yearly default at true (via SafeSettings) after the legacy key is dropped' do
+          patch settings_general_path, params: { monthly_digest_emails_enabled: '0' }
+
+          user.reload
+          expect(user.settings).not_to have_key('digest_emails_enabled')
+          expect(user.settings).not_to have_key('yearly_digest_emails_enabled')
+          expect(user.safe_settings.yearly_digest_emails_enabled?).to be true
+        end
+      end
+
+      it 'updates timezone setting with valid timezone' do
+        patch settings_general_path, params: { timezone: 'America/New_York' }
+
+        expect(response).to redirect_to(settings_general_index_path)
+        expect(user.reload.settings['timezone']).to eq('America/New_York')
+      end
+
+      it 'persists timezone across page loads' do
+        patch settings_general_path, params: { timezone: 'Asia/Tokyo' }
+        user.reload
+
+        expect(user.timezone).to eq('Asia/Tokyo')
+      end
+
+      it 'rejects invalid timezone' do
+        patch settings_general_path, params: { timezone: 'Invalid/Timezone' }
+
+        expect(user.reload.settings['timezone']).to be_nil
+        # Should not save invalid timezone
+      end
+
+      it 'accepts UTC timezone' do
+        patch settings_general_path, params: { timezone: 'UTC' }
+
+        expect(response).to redirect_to(settings_general_index_path)
+        expect(user.reload.settings['timezone']).to eq('UTC')
+      end
+
+      it 'saves the date, time and week-start preferences' do
+        patch settings_general_path,
+              params: { date_format: 'dd.mm.yyyy', time_format: '12h', first_day_of_week: 'sunday' }
+
+        expect(response).to redirect_to(settings_general_index_path)
+        expect(user.reload.settings.slice('date_format', 'time_format', 'first_day_of_week'))
+          .to eq('date_format' => 'dd.mm.yyyy', 'time_format' => '12h', 'first_day_of_week' => 'sunday')
+      end
+
+      it 'ignores unknown date, time and week-start values' do
+        user.update!(settings: user.settings.merge('date_format' => 'yyyy-mm-dd'))
+
+        patch settings_general_path,
+              params: { date_format: 'nonsense', time_format: '25h', first_day_of_week: 'friday' }
+
+        expect(user.reload.settings['date_format']).to eq('yyyy-mm-dd')
+        expect(user.settings).not_to have_key('time_format')
+        expect(user.settings).not_to have_key('first_day_of_week')
+      end
+    end
+
+    describe 'POST /test_email' do
+      let!(:user) { create(:user, :admin, settings: {}) }
+
+      around do |example|
+        original_from = UsersMailer.default_params[:from]
+        UsersMailer.default from: 'hi@dawarich.app'
+        example.run
+      ensure
+        UsersMailer.default from: original_from
+      end
+
+      before do
+        allow(DawarichSettings).to receive(:self_hosted?).and_return(true)
+        allow(ENV).to receive(:[]).and_call_original
+        allow(ENV).to receive(:[]).with('SMTP_SERVER').and_return('smtp.example.com')
+        ActionMailer::Base.deliveries.clear
+      end
+
+      it 'queues the test email through the same worker as system emails' do
+        expect do
+          post settings_test_email_path
+        end.to have_enqueued_job(ActionMailer::MailDeliveryJob).with(
+          'UsersMailer', 'test_email', 'deliver_now', params: { user: user }, args: []
+        )
+
+        expect(ActionMailer::Base.deliveries).to be_empty
+        expect(response).to redirect_to(settings_general_index_path)
+        expect(flash[:notice]).to include(user.email)
+      end
+
+      it 'delivers from the queued worker when SMTP works' do
+        perform_enqueued_jobs(only: ActionMailer::MailDeliveryJob) { post settings_test_email_path }
+
+        expect(ActionMailer::Base.deliveries.last.to).to eq([user.email])
+      end
+
+      it 'surfaces SMTP errors in the worker even when normal mail suppresses them' do
+        allow_any_instance_of(Mail::TestMailer).to receive(:deliver!)
+          .and_raise(Net::SMTPAuthenticationError.new('worker configuration failed'))
+
+        post settings_test_email_path
+
+        expect do
+          perform_enqueued_jobs(only: ActionMailer::MailDeliveryJob)
+        end.to raise_error(Net::SMTPAuthenticationError)
+      end
+
+      it 'shows an alert when SMTP is not configured' do
+        allow(ENV).to receive(:[]).with('SMTP_SERVER').and_return(nil)
+
+        post settings_test_email_path
+
+        expect(ActionMailer::Base.deliveries).to be_empty
+        expect(response).to redirect_to(settings_general_index_path)
+        expect(flash[:alert]).to be_present
+      end
+
+      it 'shows an alert when enqueueing fails' do
+        allow_any_instance_of(ActionMailer::Parameterized::MessageDelivery).to receive(:deliver_later)
+          .and_raise(Redis::CannotConnectError.new('connection failed'))
+
+        post settings_test_email_path
+
+        expect(response).to redirect_to(settings_general_index_path)
+        expect(flash[:alert]).to include('Redis::CannotConnectError')
+      end
+
+      it 'responds with turbo stream when requested' do
+        post settings_test_email_path, headers: { 'Accept' => 'text/vnd.turbo-stream.html' }
+
+        expect(response.media_type).to eq('text/vnd.turbo-stream.html')
+        expect(response.body).to include(user.email)
+      end
+
+      it 'renders the button as a Turbo POST link' do
+        get settings_general_index_path
+
+        link = response.body.scan(%r{<a[^>]*settings/general/test_email[^>]*>}).first
+        expect(link).to be_present
+        expect(link).to include('data-turbo="true"')
+        expect(link).to include('data-turbo-method="post"')
+        expect(response.body).to include(
+          '>Queues a test message through the same background worker as system emails</span>'
+        )
+      end
+
+      context 'when not self-hosted' do
+        before do
+          allow(DawarichSettings).to receive(:self_hosted?).and_return(false)
+        end
+
+        it 'is not authorized' do
+          post settings_test_email_path
+
+          expect(ActionMailer::Base.deliveries).to be_empty
+          expect(response).to redirect_to(root_path)
+        end
+
+        it 'does not render the test email button' do
+          get settings_general_index_path
+
+          expect(response.body).not_to include('test_email')
+        end
+      end
+    end
+
+    describe 'POST /verify_supporter' do
+      context 'when both email and github username are blank' do
+        it 'redirects with alert' do
+          post settings_verify_supporter_path, params: { supporter_email: '', supporter_github_username: '' }
+
+          expect(response).to redirect_to(settings_general_index_path)
+          expect(flash[:alert]).to include('email address or GitHub username')
+        end
+      end
+
+      context 'when github username is a verified supporter' do
+        before do
+          allow_any_instance_of(Supporter::VerifyGithubUsername).to receive(:call)
+            .and_return({ supporter: true, platform: 'github' })
+        end
+
+        it 'saves the username and redirects with success notice' do
+          post settings_verify_supporter_path, params: { supporter_github_username: 'octocat' }
+
+          expect(response).to redirect_to(settings_general_index_path)
+          expect(flash[:notice]).to include('Verified!')
+          expect(user.reload.settings['supporter_github_username']).to eq('octocat')
+        end
+      end
+
+      context 'when an App Store supporter submits an email that is not a supporter' do
+        before do
+          allow(DawarichSettings).to receive(:self_hosted?).and_return(true)
+          user.update!(settings: { 'app_store_supporter' => true })
+          allow_any_instance_of(Supporter::VerifyEmail).to receive(:call).and_return({ supporter: false })
+        end
+
+        it 'reports the email as not found' do
+          post settings_verify_supporter_path, params: { supporter_email: 'typo@example.com' }
+
+          expect(flash[:notice]).to be_nil
+          expect(flash[:alert]).to be_present
+        end
+      end
+
+      context 'when github username is not a supporter' do
+        before do
+          allow_any_instance_of(Supporter::VerifyEmail).to receive(:call).and_return({ supporter: false })
+          allow_any_instance_of(Supporter::VerifyGithubUsername).to receive(:call).and_return({ supporter: false })
+        end
+
+        it 'saves the username and redirects with failure alert' do
+          post settings_verify_supporter_path, params: { supporter_github_username: 'nobody' }
+
+          expect(response).to redirect_to(settings_general_index_path)
+          expect(flash[:alert]).to include('supporter list')
+          expect(user.reload.settings['supporter_github_username']).to eq('nobody')
+        end
+      end
+
+      context 'when email is a verified supporter' do
+        before do
+          allow_any_instance_of(Supporter::VerifyEmail).to receive(:call)
+            .and_return({ supporter: true, platform: 'patreon' })
+        end
+
+        it 'saves email and redirects with success notice' do
+          post settings_verify_supporter_path, params: { supporter_email: 'supporter@example.com' }
+
+          expect(response).to redirect_to(settings_general_index_path)
+          expect(flash[:notice]).to include('Verified!')
+          expect(user.reload.settings['supporter_email']).to eq('supporter@example.com')
+        end
+      end
+
+      context 'when email is not a supporter' do
+        before do
+          allow_any_instance_of(Supporter::VerifyEmail).to receive(:call)
+            .and_return({ supporter: false })
+        end
+
+        it 'saves email and redirects with failure alert' do
+          post settings_verify_supporter_path, params: { supporter_email: 'unknown@example.com' }
+
+          expect(response).to redirect_to(settings_general_index_path)
+          expect(flash[:alert]).to include('supporter list')
+          expect(user.reload.settings['supporter_email']).to eq('unknown@example.com')
+        end
+      end
+
+      context 'when one field is submitted blank while the other was saved' do
+        before do
+          allow_any_instance_of(Supporter::VerifyEmail).to receive(:call).and_return({ supporter: false })
+          allow_any_instance_of(Supporter::VerifyGithubUsername).to receive(:call).and_return({ supporter: false })
+          user.update!(settings: user.settings.merge('supporter_email' => 'saved@example.com'))
+        end
+
+        it 'does not wipe the previously saved email' do
+          post settings_verify_supporter_path, params: { supporter_email: '', supporter_github_username: 'octocat' }
+
+          expect(user.reload.settings['supporter_email']).to eq('saved@example.com')
+          expect(user.reload.settings['supporter_github_username']).to eq('octocat')
+        end
+      end
+    end
+  end
+
+  context 'when user is not authenticated' do
+    it 'redirects to the sign in page' do
+      get settings_general_index_path
+
+      expect(response).to redirect_to(new_user_session_path)
+    end
+  end
+end

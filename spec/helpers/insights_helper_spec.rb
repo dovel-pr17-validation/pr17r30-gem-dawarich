@@ -1,0 +1,215 @@
+# frozen_string_literal: true
+
+require 'rails_helper'
+
+RSpec.describe InsightsHelper, type: :helper do
+  describe '#calculate_activity_level' do
+    let(:levels) { { p25: 1000, p50: 5000, p75: 10_000, p90: 20_000 } }
+
+    it 'returns 0 for nil distance' do
+      expect(helper.calculate_activity_level(nil, levels)).to eq(0)
+    end
+
+    it 'returns 0 for zero distance' do
+      expect(helper.calculate_activity_level(0, levels)).to eq(0)
+    end
+
+    it 'returns 1 for distance below p25' do
+      expect(helper.calculate_activity_level(500, levels)).to eq(1)
+    end
+
+    it 'returns 1 for distance at p25 threshold' do
+      expect(helper.calculate_activity_level(1000, levels)).to eq(1)
+    end
+
+    it 'returns 2 for distance between p25 and p50' do
+      expect(helper.calculate_activity_level(3000, levels)).to eq(1)
+    end
+
+    it 'returns 2 for distance at p50 threshold' do
+      expect(helper.calculate_activity_level(5000, levels)).to eq(2)
+    end
+
+    it 'returns 3 for distance at p75 threshold' do
+      expect(helper.calculate_activity_level(10_000, levels)).to eq(3)
+    end
+
+    it 'returns 4 for distance at p90 threshold' do
+      expect(helper.calculate_activity_level(20_000, levels)).to eq(4)
+    end
+
+    it 'returns 4 for distance above p90' do
+      expect(helper.calculate_activity_level(50_000, levels)).to eq(4)
+    end
+  end
+
+  describe '#format_heatmap_distance' do
+    before do
+      allow(Stat).to receive(:convert_distance).and_call_original
+    end
+
+    it 'returns 0 for nil meters' do
+      expect(helper.format_heatmap_distance(nil, 'km')).to eq('0')
+    end
+
+    it 'returns 0 for zero meters' do
+      expect(helper.format_heatmap_distance(0, 'km')).to eq('0')
+    end
+
+    it 'formats distance in km' do
+      result = helper.format_heatmap_distance(5000, 'km')
+      expect(result).to eq('5.0 km')
+    end
+
+    it 'formats small distances in meters' do
+      result = helper.format_heatmap_distance(500, 'km')
+      expect(result).to eq('500 m')
+    end
+
+    it 'formats distance in miles' do
+      result = helper.format_heatmap_distance(3218, 'mi') # 2 miles
+      expect(result).to eq('2.0 mi')
+    end
+
+    it 'formats small distances in feet for miles unit' do
+      result = helper.format_heatmap_distance(500, 'mi') # about 0.31 miles = ~1640 ft
+      expect(result).to match(/\d+ ft/)
+    end
+  end
+
+  describe '#heatmap_week_columns' do
+    context 'with 2024 (leap year, Jan 1 is Monday)' do
+      let(:weeks) { helper.heatmap_week_columns(2024) }
+
+      it 'returns array of week start dates' do
+        expect(weeks).to be_an(Array)
+        expect(weeks).to all(be_a(Date))
+      end
+
+      it 'starts from the Monday containing or before Jan 1' do
+        expect(weeks.first).to eq(Date.new(2024, 1, 1))
+      end
+
+      it 'ends on or after Dec 31' do
+        last_week = weeks.last
+        week_end = last_week + 6
+        expect(week_end).to be >= Date.new(2024, 12, 31)
+      end
+
+      it 'returns approximately 52-53 weeks' do
+        expect(weeks.size).to be_between(52, 54)
+      end
+    end
+
+    context 'with a Sunday week start' do
+      it 'starts from the Sunday containing or before Jan 1 and ends on a Saturday' do
+        weeks = helper.heatmap_week_columns(2026, week_start: :sunday)
+
+        expect(weeks.first).to eq(Date.new(2025, 12, 28))
+        expect(weeks.last + 6).to eq(Date.new(2027, 1, 2))
+      end
+    end
+
+    context 'with 2023 (Jan 1 is Sunday)' do
+      let(:weeks) { helper.heatmap_week_columns(2023) }
+
+      it 'starts from the Monday before Jan 1' do
+        # Jan 1 2023 is Sunday, so we go back to Dec 26 2022 (Monday)
+        expect(weeks.first).to eq(Date.new(2022, 12, 26))
+      end
+    end
+  end
+
+  describe 'weekday ordering' do
+    let(:user) { create(:user) }
+    let(:monday_first) { [1000, 2000, 0, 0, 0, 0, 7000] }
+    let(:digest) { Struct.new(:weekly_pattern).new(monday_first) }
+
+    def as_sunday_user(&)
+      Users::DateTimePreferences.with(Users::DateTimePreferences.new(first_day_of_week: 'sunday'), &)
+    end
+
+    it 'lists the weekly pattern from Monday by default' do
+      expect(helper.weekly_pattern_chart_data(digest, user).first(2)).to eq([['Mon', 1], ['Tue', 2]])
+    end
+
+    it 'lists the weekly pattern from Sunday for a Sunday week start' do
+      data = as_sunday_user { helper.weekly_pattern_chart_data(digest, user) }
+
+      expect(data.first(3)).to eq([['Sun', 7], ['Mon', 1], ['Tue', 2]])
+    end
+
+    it 'lists the day-of-week strip from the first day of week' do
+      expect(helper.weekday_strip(monday_first).first).to eq(['Mon', 1000])
+      expect(as_sunday_user { helper.weekday_strip(monday_first) }.first(2)).to eq([['Sun', 7000], ['Mon', 1000]])
+    end
+  end
+
+  describe '#heatmap_month_labels' do
+    let(:weeks) { helper.heatmap_week_columns(2024) }
+    let(:labels) { helper.heatmap_month_labels(weeks, 2024) }
+
+    it 'returns array of label hashes' do
+      expect(labels).to be_an(Array)
+      labels.each do |label|
+        expect(label).to have_key(:index)
+        expect(label).to have_key(:name)
+      end
+    end
+
+    it 'includes all 12 month abbreviations' do
+      month_names = labels.map { |l| l[:name] }
+      expect(month_names).to include('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                                     'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec')
+    end
+
+    it 'has indices in ascending order' do
+      indices = labels.map { |l| l[:index] }
+      expect(indices).to eq(indices.sort)
+    end
+  end
+
+  describe '#format_location_time' do
+    it 'returns "0 min" for nil' do
+      expect(helper.format_location_time(nil)).to eq('0 min')
+    end
+
+    it 'returns "0 min" for zero' do
+      expect(helper.format_location_time(0)).to eq('0 min')
+    end
+
+    it 'returns minutes for sub-hour durations' do
+      expect(helper.format_location_time(30)).to eq('30 min')
+    end
+
+    it 'returns hours for sub-day durations' do
+      expect(helper.format_location_time(120)).to eq('2 hours')
+    end
+
+    it 'returns singular hour' do
+      expect(helper.format_location_time(60)).to eq('1 hour')
+    end
+
+    it 'returns total days for single-day durations' do
+      expect(helper.format_location_time(1440)).to eq('1 day')
+    end
+
+    it 'returns total days for multi-day durations' do
+      expect(helper.format_location_time(2 * 1440)).to eq('2 days')
+    end
+
+    # Regression: ActiveSupport::Duration#parts decomposes into months/weeks/days,
+    # so parts[:days] only returns the day-remainder (max ~6). The previous
+    # implementation reported "4 days" for 191_741 minutes (≈133 days), which
+    # silently underreports time spent at top locations.
+    it 'returns the total day count for durations spanning months' do
+      # 133 days = 191_520 minutes
+      expect(helper.format_location_time(133 * 1440)).to eq('133 days')
+    end
+
+    it 'returns the total day count for durations spanning years' do
+      # 400 days = 576_000 minutes — clearly across a year boundary
+      expect(helper.format_location_time(400 * 1440)).to eq('400 days')
+    end
+  end
+end

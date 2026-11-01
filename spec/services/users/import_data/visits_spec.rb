@@ -1,0 +1,395 @@
+# frozen_string_literal: true
+
+require 'rails_helper'
+
+RSpec.describe Users::ImportData::Visits, type: :service do
+  let(:user) { create(:user) }
+
+  describe '#call' do
+    context 'when visits_data is not an array' do
+      it 'returns 0 for nil' do
+        service = described_class.new(user, nil)
+        expect(service.call).to eq(0)
+      end
+
+      it 'returns 0 for a hash' do
+        service = described_class.new(user, { 'name' => 'test' })
+        expect(service.call).to eq(0)
+      end
+    end
+
+    context 'when visits_data is empty' do
+      it 'returns 0' do
+        service = described_class.new(user, [])
+        expect(service.call).to eq(0)
+      end
+    end
+
+    context 'with valid visits data' do
+      let(:visits_data) do
+        [
+          {
+            'name' => 'Work Visit',
+            'started_at' => '2024-01-01T09:00:00Z',
+            'ended_at' => '2024-01-01T17:00:00Z',
+            'duration' => 28_800,
+            'status' => 'confirmed'
+          },
+          {
+            'name' => 'Home Visit',
+            'started_at' => '2024-01-01T18:00:00Z',
+            'ended_at' => '2024-01-01T22:00:00Z',
+            'duration' => 14_400,
+            'status' => 'suggested'
+          }
+        ]
+      end
+
+      it 'creates the visits' do
+        service = described_class.new(user, visits_data)
+
+        expect { service.call }.to change { user.visits.count }.by(2)
+      end
+
+      it 'returns the count of created visits' do
+        service = described_class.new(user, visits_data)
+
+        expect(service.call).to eq(2)
+      end
+
+      it 'sets the correct attributes' do
+        service = described_class.new(user, visits_data)
+        service.call
+
+        visit = user.visits.find_by(name: 'Work Visit')
+        expect(visit).to be_present
+        expect(visit.duration).to eq(28_800)
+        expect(visit.status).to eq('confirmed')
+      end
+    end
+
+    context 'with place_reference' do
+      let(:visits_data) do
+        [
+          {
+            'name' => 'Office Visit',
+            'started_at' => '2024-01-01T09:00:00Z',
+            'ended_at' => '2024-01-01T17:00:00Z',
+            'duration' => 28_800,
+            'status' => 'confirmed',
+            'place_reference' => {
+              'name' => 'Office Building',
+              'latitude' => '40.7589',
+              'longitude' => '-73.9851',
+              'source' => 'manual'
+            }
+          }
+        ]
+      end
+
+      context 'when place does not exist' do
+        it 'creates the place and associates it' do
+          service = described_class.new(user, visits_data)
+
+          expect { service.call }.to change { Place.count }.by(1)
+
+          visit = user.visits.find_by(name: 'Office Visit')
+          expect(visit.place).to be_present
+          expect(visit.place.name).to eq('Office Building')
+        end
+      end
+
+      context 'when place already exists with exact coordinates' do
+        let!(:existing_place) do
+          create(:place, user: user, name: 'Office Building', latitude: 40.7589, longitude: -73.9851)
+        end
+
+        it 'uses the existing place' do
+          service = described_class.new(user, visits_data)
+
+          expect { service.call }.not_to(change { Place.count })
+
+          visit = user.visits.find_by(name: 'Office Visit')
+          expect(visit.place).to eq(existing_place)
+        end
+      end
+
+      context 'when place exists with nearby coordinates' do
+        let!(:nearby_place) do
+          create(:place, user: user, name: 'Office Building', latitude: 40.75895, longitude: -73.98515)
+        end
+
+        it 'uses the nearby place' do
+          service = described_class.new(user, visits_data)
+
+          expect { service.call }.not_to(change { Place.count })
+
+          visit = user.visits.find_by(name: 'Office Visit')
+          expect(visit.place).to eq(nearby_place)
+        end
+      end
+
+      context 'when only a differently named place is nearby' do
+        before do
+          create(:place, user:, name: 'Different Name', latitude: 40.75895, longitude: -73.98515)
+        end
+
+        it 'creates the referenced Place instead of merging by proximity alone' do
+          service = described_class.new(user, visits_data)
+
+          expect { service.call }.to change { Place.count }.by(1)
+          expect(user.visits.find_by(name: 'Office Visit').place.name).to eq('Office Building')
+        end
+      end
+    end
+
+    context 'with raw foreign keys in the archive row' do
+      let(:other_place) { create(:place, user: create(:user), name: 'Elsewhere') }
+      let(:other_import) { create(:import) }
+      let(:visits_data) do
+        [{
+          'name' => 'Tampered', 'started_at' => '2024-01-01T09:00:00Z', 'ended_at' => '2024-01-01T10:00:00Z',
+          'duration' => 3600, 'status' => 'confirmed', 'place_id' => other_place.id, 'import_id' => other_import.id
+        }]
+      end
+
+      it 'does not link the visit to records the user does not own' do
+        described_class.new(user, visits_data).call
+
+        expect(user.visits.last).to have_attributes(place_id: nil, import_id: nil)
+      end
+    end
+
+    context 'with a legacy area_id' do
+      let(:visits_data) do
+        [
+          {
+            'name' => 'Home',
+            'area_id' => 91,
+            'started_at' => '2024-01-01T18:00:00Z',
+            'ended_at' => '2024-01-01T22:00:00Z',
+            'duration' => 14_400,
+            'status' => 'confirmed'
+          }
+        ]
+      end
+      let(:reference) do
+        {
+          'name' => 'Home',
+          'latitude' => '40.7128',
+          'longitude' => '-74.0060',
+          'source' => 'manual',
+          'visit_radius' => 150
+        }
+      end
+
+      it 'remaps it to a canonical Place and never persists the foreign Area ID' do
+        service = described_class.new(
+          user,
+          visits_data,
+          legacy_area_place_references: { '91' => reference }
+        )
+
+        service.call
+
+        visit = user.visits.find_by(name: 'Home')
+        expect(visit.area_id).to be_nil
+        expect(visit.place).to have_attributes(name: 'Home', visit_radius: 150)
+        expect(visit.location_label).to eq('Home')
+      end
+    end
+
+    context 'with a visit from an archive made before Places' do
+      let(:legacy_row) do
+        {
+          'name' => 'Corner Cafe',
+          'started_at' => '2024-01-01T09:00:00Z',
+          'ended_at' => '2024-01-01T10:00:00Z',
+          'duration' => 3600,
+          'status' => 'suggested'
+        }
+      end
+
+      it 'keeps a suggested name only as its label, like the upgrade backfill' do
+        described_class.new(user, [legacy_row]).call
+
+        expect(user.visits.sole).to have_attributes(name: nil, location_label: 'Corner Cafe')
+      end
+
+      it 'keeps a confirmed name and copies it into the label' do
+        described_class.new(user, [legacy_row.merge('status' => 'confirmed')]).call
+
+        expect(user.visits.sole).to have_attributes(name: 'Corner Cafe', location_label: 'Corner Cafe')
+      end
+
+      it 'does not duplicate the visit the upgrade backfill already relabelled' do
+        create(:visit, user:, name: nil, location_label: 'Corner Cafe',
+                       started_at: Time.zone.parse('2024-01-01T09:00:00Z'),
+                       ended_at: Time.zone.parse('2024-01-01T10:00:00Z'))
+
+        expect { described_class.new(user, [legacy_row]).call }.not_to(change { user.visits.count })
+      end
+    end
+
+    context 'with nil place_reference' do
+      let(:visits_data) do
+        [
+          {
+            'name' => 'Unknown Visit',
+            'started_at' => '2024-01-01T09:00:00Z',
+            'ended_at' => '2024-01-01T17:00:00Z',
+            'duration' => 28_800,
+            'status' => 'suggested',
+            'place_reference' => nil
+          }
+        ]
+      end
+
+      it 'creates the visit without a place' do
+        service = described_class.new(user, visits_data)
+        service.call
+
+        visit = user.visits.find_by(location_label: 'Unknown Visit')
+        expect(visit).to be_present
+        expect(visit.place).to be_nil
+      end
+    end
+
+    context 'with duplicate visits' do
+      let(:visits_data) do
+        [
+          {
+            'name' => 'Duplicate Visit',
+            'started_at' => '2024-01-01T09:00:00Z',
+            'ended_at' => '2024-01-01T17:00:00Z',
+            'duration' => 28_800,
+            'status' => 'confirmed'
+          }
+        ]
+      end
+
+      let!(:existing_visit) do
+        create(:visit,
+               user: user,
+               name: 'Duplicate Visit',
+               started_at: Time.zone.parse('2024-01-01T09:00:00Z'),
+               ended_at: Time.zone.parse('2024-01-01T17:00:00Z'))
+      end
+
+      it 'skips the duplicate visit' do
+        service = described_class.new(user, visits_data)
+
+        expect { service.call }.not_to(change { user.visits.count })
+      end
+
+      it 'returns 0 for skipped visits' do
+        service = described_class.new(user, visits_data)
+
+        expect(service.call).to eq(0)
+      end
+    end
+
+    context 'with two archive visits that start together at one Place' do
+      let(:place_reference) do
+        { 'name' => 'Office Building', 'latitude' => '40.7589', 'longitude' => '-73.9851', 'source' => 'manual' }
+      end
+      let(:visits_data) do
+        [
+          { 'name' => 'Office Visit', 'started_at' => '2024-01-01T09:00:00Z', 'ended_at' => '2024-01-01T17:00:00Z',
+            'duration' => 28_800, 'status' => 'confirmed', 'place_reference' => place_reference },
+          { 'name' => 'Office', 'started_at' => '2024-01-01T09:00:00Z', 'ended_at' => '2024-01-01T12:00:00Z',
+            'duration' => 10_800, 'status' => 'suggested', 'place_reference' => place_reference }
+        ]
+      end
+
+      it 'keeps the first one and skips the other without reporting an error' do
+        allow(ExceptionReporter).to receive(:call)
+
+        expect(described_class.new(user, visits_data).call).to eq(1)
+        expect(user.visits.pluck(:name)).to eq(['Office Visit'])
+        expect(ExceptionReporter).not_to have_received(:call)
+      end
+    end
+
+    context 'with unnamed visits in the same time window at different Places' do
+      let(:visits_data) do
+        %w[Home Office].each_with_index.map do |place_name, index|
+          {
+            'name' => nil,
+            'location_label' => 'Detected stop',
+            'started_at' => '2024-01-01T09:00:00Z',
+            'ended_at' => '2024-01-01T10:00:00Z',
+            'duration' => 3600,
+            'status' => 'confirmed',
+            'place_reference' => {
+              'name' => place_name,
+              'latitude' => (40 + index).to_s,
+              'longitude' => (-74 - index).to_s,
+              'source' => 'manual'
+            }
+          }
+        end
+      end
+
+      it 'preserves both distinct visits' do
+        service = described_class.new(user, visits_data)
+
+        expect(service.call).to eq(2)
+        expect(user.visits.includes(:place).map { |visit| visit.place.name }).to contain_exactly('Home', 'Office')
+      end
+    end
+
+    context 'with invalid visit data' do
+      let(:visits_data) do
+        [
+          { 'not_a_visit' => 'invalid' },
+          'string_instead_of_hash',
+          nil,
+          {
+            'name' => 'Valid Visit',
+            'started_at' => '2024-01-01T09:00:00Z',
+            'ended_at' => '2024-01-01T17:00:00Z',
+            'duration' => 28_800,
+            'status' => 'confirmed'
+          }
+        ]
+      end
+
+      it 'skips invalid entries and imports valid ones' do
+        service = described_class.new(user, visits_data)
+
+        expect(service.call).to eq(1)
+        expect(user.visits.find_by(name: 'Valid Visit')).to be_present
+      end
+    end
+
+    context 'with multiple users' do
+      let(:other_user) { create(:user) }
+      let!(:other_user_visit) do
+        create(:visit,
+               user: other_user,
+               name: 'Other User Visit',
+               started_at: Time.zone.parse('2024-01-01T09:00:00Z'),
+               ended_at: Time.zone.parse('2024-01-01T17:00:00Z'))
+      end
+
+      let(:visits_data) do
+        [
+          {
+            'name' => 'Other User Visit',
+            'started_at' => '2024-01-01T09:00:00Z',
+            'ended_at' => '2024-01-01T17:00:00Z',
+            'duration' => 28_800,
+            'status' => 'confirmed'
+          }
+        ]
+      end
+
+      it 'creates the visit for the target user (not a duplicate across users)' do
+        service = described_class.new(user, visits_data)
+
+        expect { service.call }.to change { user.visits.count }.by(1)
+      end
+    end
+  end
+end

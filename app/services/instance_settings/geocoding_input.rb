@@ -1,0 +1,77 @@
+# frozen_string_literal: true
+
+module InstanceSettings
+  class GeocodingInput
+    HOST_KEYS = %i[photon_api_host nominatim_api_host].freeze
+    # Photon takes an ISO-639-1 code, or "default" for names in the local language.
+    LANGUAGE_FORMAT = /\A(?:[a-z]{2}|default)\z/
+
+    attr_reader :values, :errors
+
+    def initialize(values)
+      @values = values.dup
+      @errors = []
+
+      normalize_hosts
+      validate_hosts
+      normalize_language
+      validate_language
+      drop_komoot_key
+      validate_chibigeo_key
+    end
+
+    def valid?
+      errors.empty?
+    end
+
+    private
+
+    def normalize_hosts
+      HOST_KEYS.each do |key|
+        next unless values[key].is_a?(String)
+
+        values[key] = values[key].strip.downcase.sub(%r{\Ahttps?://}, '').sub(%r{/+\z}, '')
+      end
+    end
+
+    def validate_hosts
+      invalid = HOST_KEYS.any? do |key|
+        values[key].present? && !values[key].match?(ServiceSettings::GeocodingSchema::HOST_FORMAT)
+      end
+      errors << I18n.t('admin.settings.update.host_invalid') if invalid
+    end
+
+    def normalize_language
+      return unless values[:photon_api_language].is_a?(String)
+
+      values[:photon_api_language] = values[:photon_api_language].strip.downcase
+    end
+
+    def validate_language
+      return unless values.key?(:photon_api_language)
+      return if values[:photon_api_language].to_s.match?(LANGUAGE_FORMAT)
+
+      errors << I18n.t('admin.settings.update.language_invalid')
+    end
+
+    def drop_komoot_key
+      return unless values.key?(:photon_api_host)
+      return unless Geocoding::Providers.komoot?('photon', photon_host)
+      return if Resolver.pinned?(:photon_api_key)
+
+      values[:photon_api_key] = nil
+    end
+
+    def validate_chibigeo_key
+      return unless values.key?(:photon_api_host) || values.key?(:photon_api_key)
+      return unless Geocoding::Providers.chibigeo?('photon', photon_host)
+
+      key = values.key?(:photon_api_key) ? values[:photon_api_key] : Resolver.value(:photon_api_key)
+      errors << I18n.t('admin.settings.update.chibigeo_key_required') if key.blank?
+    end
+
+    def photon_host
+      values.key?(:photon_api_host) ? values[:photon_api_host] : Resolver.value(:photon_api_host)
+    end
+  end
+end

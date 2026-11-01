@@ -1,0 +1,20 @@
+<div class="mb-4">
+  <p class="text-base-content/60 text-sm">
+    <%= trip.distance_in_unit(distance_unit).round %> <%= distance_unit %>
+    <%= t('.middot').html_safe %>
+    <%= trip_duration(trip) %>
+    <%= t('.middot').html_safe %>
+    <% if trip.visited_countries.any? %>
+      <%= t('.country_count', count: trip.visited_countries.count) %>
+    <% else %>
+      <span class="text-base-content/40"><%= t('.mdash').html_safe %></span>
+    <% end %>
+  </p>
+  <% if trip.visited_countries.any? %>
+    <div class="flex flex-wrap items-center gap-1.5 mt-2">
+      <% trip.visited_countries.sort.each do |country| %>
+        <%= country_flag(country) %>
+      <% end %>
+    </div>
+  <% end %>
+</div>

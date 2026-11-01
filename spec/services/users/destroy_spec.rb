@@ -1,0 +1,669 @@
+# frozen_string_literal: true
+
+require 'rails_helper'
+
+RSpec.describe Users::Destroy do
+  describe '#call' do
+    let(:user) { create(:user) }
+    let(:service) { described_class.new(user) }
+
+    before do
+      user.mark_as_deleted!
+    end
+
+    context 'with minimal user data' do
+      it 'holds an exclusive user-data lock while deleting associated records' do
+        expect(Users::DataLock).to receive(:with_exclusive).with(user.id).and_call_original
+
+        service.call
+      end
+
+      it 'hard deletes the user record' do
+        expect { service.call }.to change { User.unscoped.count }.by(-1)
+      end
+
+      it 'returns true on success' do
+        expect(service.call).to be true
+      end
+
+      it 'logs the deletion' do
+        allow(Rails.logger).to receive(:info)
+
+        service.call
+
+        expect(Rails.logger).to have_received(:info).with(/User \d+ \(.+\) and all associated data deleted/)
+      end
+    end
+
+    context 'with geofencing records' do
+      it 'deletes events, webhooks and deliveries with the user' do
+        delivery = create(:webhook_delivery, webhook: create(:webhook, user:))
+
+        service.call
+
+        expect(GeofenceEvent.where(user_id: user.id)).to be_empty
+        expect(Webhook.where(user_id: user.id)).to be_empty
+        expect(WebhookDelivery.where(id: delivery.id)).to be_empty
+      end
+
+      it 'forgets the user\'s geofence state' do
+        GeofenceEvents::StateStore.new(user).advance_evaluated_at!(Time.current.to_i)
+
+        service.call
+
+        expect(Sidekiq.redis_pool.with { |redis| redis.call('EXISTS', "geofence:evaluated_at:#{user.id}") }).to eq(0)
+      end
+    end
+
+    context 'with associated records without foreign key constraints' do
+      let!(:points) { create_list(:point, 5, user:) }
+      let!(:import) { create(:import, user:) }
+      let!(:stat) { create(:stat, user:, year: 2024, month: 1) }
+      let!(:place) { create(:place, user:) }
+      let!(:trip) { create(:trip, user:) }
+      let!(:notification) { create(:notification, user:) }
+
+      it 'deletes all points' do
+        user_id = user.id
+        service.call
+        expect(Point.where(user_id: user_id).count).to eq(0)
+      end
+
+      it 'deletes all imports' do
+        user_id = user.id
+        service.call
+        expect(Import.where(user_id: user_id).count).to eq(0)
+      end
+
+      it 'deletes all stats' do
+        user_id = user.id
+        service.call
+        expect(Stat.where(user_id: user_id).count).to eq(0)
+      end
+
+      it 'deletes all places' do
+        user_id = user.id
+        service.call
+        expect(Place.where(user_id: user_id).count).to eq(0)
+      end
+
+      it 'deletes all trips' do
+        user_id = user.id
+        service.call
+        expect(Trip.where(user_id: user_id).count).to eq(0)
+      end
+
+      it 'deletes all notifications' do
+        user_id = user.id
+        service.call
+        expect(Notification.where(user_id: user_id).count).to eq(0)
+      end
+
+      it 'performs all deletions in a transaction' do
+        # Mock error before user deletion
+        allow(Rails.logger).to receive(:info)
+        allow(Rails.logger).to receive(:error)
+        allow(ExceptionReporter).to receive(:call)
+        allow_any_instance_of(described_class).to receive(:cancel_scheduled_jobs)
+        allow(Point).to receive(:where).and_call_original
+
+        # This will cause the transaction to fail
+        allow(user).to receive(:delete).and_raise(StandardError, 'Database error')
+
+        expect { service.call }.to raise_error(StandardError)
+      end
+    end
+
+    context 'with point and track revisions' do
+      before do
+        create(:point, user:, timestamp: Time.utc(2026, 9, 10).to_i)
+        create(:track, user:, start_at: Time.utc(2026, 9, 10), end_at: Time.utc(2026, 9, 10, 1))
+      end
+
+      it 'leaves no revision rows for the deleted user' do
+        service.call
+
+        expect(Points::Revision.where(user_id: user.id)).to be_empty
+        expect(Tracks::Revision.where(user_id: user.id)).to be_empty
+      end
+    end
+
+    context 'with achievement records' do
+      let!(:progress) { create(:achievement_progress, user: user) }
+      let!(:achievement) { create(:user_achievement, user: user) }
+
+      before { user.service_settings.delete_all }
+
+      it 'deletes both achievement tables before hard deleting the user' do
+        service.call
+
+        expect(Achievements::Progress.where(id: progress.id)).not_to exist
+        expect(UserAchievement.where(id: achievement.id)).not_to exist
+        expect(User.unscoped.where(id: user.id)).not_to exist
+      end
+    end
+
+    context 'with TREK sources and itineraries' do
+      before do
+        stub_host_addresses('trek.example.test', '93.184.216.34')
+      end
+
+      it 'deletes a connected source even when no trips were imported' do
+        source = create(:trip_source, user:)
+
+        expect { service.call }.to change { User.unscoped.exists?(user.id) }.from(true).to(false)
+        expect(TripSource.exists?(source.id)).to be(false)
+      end
+
+      it 'deletes the entire planned itinerary and its source without touching another account' do
+        source = create(:trip_source, user:)
+        trip = create(:trip, user:, trip_source: source, source_identifier: '12', source_status: :active)
+        day = trip.planned_days.create!(date: trip.started_at.to_date, position: 1)
+        stop = day.planned_stops.create!(name: 'Museum', position: 0)
+        day_note = day.planned_day_notes.create!(body: 'Bring tickets', position: 0)
+        reservation = trip.planned_reservations.create!(planned_day: day, title: 'Tickets')
+        accommodation = trip.planned_accommodations.create!(name: 'Hotel')
+        traveller = trip.planned_travellers.create!(name: 'Ada')
+        unplanned_place = trip.planned_unplanned_places.create!(name: 'Market', position: 0)
+        note = trip.notes.create!(user:, date: day.date, body: 'Day journal')
+        other_source = create(:trip_source)
+
+        service.call
+
+        [source, trip, day, stop, day_note, reservation, accommodation, traveller, unplanned_place,
+         note].each do |record|
+          expect(record.class.exists?(record.id)).to be(false)
+        end
+        expect(User.unscoped.exists?(user.id)).to be(false)
+        expect(TripSource.exists?(other_source.id)).to be(true)
+      end
+    end
+
+    context 'with a poster' do
+      let!(:poster) { create(:poster, user:) }
+
+      before do
+        poster.image.attach(
+          io: StringIO.new('image'),
+          filename: 'poster.png',
+          content_type: 'image/png'
+        )
+        poster.print_pdf.attach(
+          io: StringIO.new('pdf'),
+          filename: 'poster.pdf',
+          content_type: 'application/pdf'
+        )
+      end
+
+      it 'deletes the poster and its attachments before the user' do
+        user_id = user.id
+        poster_id = poster.id
+        blob_ids = [poster.image.blob_id, poster.print_pdf.blob_id]
+
+        expect { perform_enqueued_jobs { service.call } }.not_to raise_error
+
+        expect(User.unscoped.where(id: user_id)).not_to exist
+        expect(Poster.where(id: poster_id)).not_to exist
+        expect(ActiveStorage::Blob.where(id: blob_ids)).to be_empty
+      end
+
+      it 'preserves the poster and its attachments when deletion rolls back' do
+        blob_ids = [poster.image.blob_id, poster.print_pdf.blob_id]
+        allow(user).to receive(:delete).and_raise(ActiveRecord::StatementInvalid, 'delete failed')
+
+        expect { service.call }.to raise_error(ActiveRecord::StatementInvalid, 'delete failed')
+
+        expect(Poster.where(id: poster.id)).to exist
+        expect(ActiveStorage::Blob.where(id: blob_ids).count).to eq(2)
+      end
+    end
+
+    context 'with other FK-backed user records missing from the cleanup list' do
+      let!(:flight) { create(:flight, user:) }
+      let!(:note) { create(:note, user:) }
+      let!(:route_video) { create(:route_video, :with_file, user:) }
+      let!(:service_setting) { create(:service_setting, user:) }
+
+      it 'deletes the records before the user' do
+        user_id = user.id
+        flight_id = flight.id
+        note_id = note.id
+
+        expect { service.call }.not_to raise_error
+
+        expect(User.unscoped.where(id: user_id)).not_to exist
+        expect(Flight.where(id: flight_id)).not_to exist
+        expect(Note.where(id: note_id)).not_to exist
+      end
+
+      it 'deletes route videos with their files and service settings' do
+        blob_id = route_video.file.blob_id
+
+        expect { perform_enqueued_jobs { service.call } }.not_to raise_error
+
+        expect(RouteVideo.where(id: route_video.id)).not_to exist
+        expect(ActiveStorage::Blob.where(id: blob_id)).not_to exist
+        expect(ServiceSetting.where(id: service_setting.id)).not_to exist
+      end
+    end
+
+    context 'with scheduled jobs' do
+      it 'attempts to cancel scheduled jobs for the user' do
+        allow(Rails.logger).to receive(:info)
+
+        service.call
+
+        expect(Rails.logger).to have_received(:info).with(/Cancelled \d+ scheduled jobs for user #{user.id}/)
+      end
+
+      describe 'CANCELLABLE_JOB_CLASSES' do
+        it 'lists only constants that resolve at runtime (no stale class names)' do
+          described_class::CANCELLABLE_JOB_CLASSES.each do |class_name|
+            expect { class_name.constantize }.not_to(
+              raise_error,
+              "Expected #{class_name} to constantize, but it does not exist."
+            )
+          end
+        end
+
+        it 'includes both the monthly and yearly digest email-sending jobs' do
+          expect(described_class::CANCELLABLE_JOB_CLASSES).to include(
+            'Users::Digests::Yearly::EmailSendingJob',
+            'Users::Digests::Monthly::EmailSendingJob'
+          )
+        end
+      end
+
+      context 'when both monthly and yearly digest email jobs are scheduled for the user' do
+        before do
+          Sidekiq.redis { |conn| conn.del('schedule') }
+          Sidekiq.redis do |conn|
+            conn.zadd(
+              'schedule',
+              1.day.from_now.to_f,
+              {
+                'class' => 'ActiveJob::QueueAdapters::SidekiqAdapter::JobWrapper',
+                'wrapped' => 'Users::Digests::Monthly::EmailSendingJob',
+                'queue' => 'mailers',
+                'args' => [{ 'job_class' => 'Users::Digests::Monthly::EmailSendingJob',
+                             'arguments' => [user.id, 2026, 3] }]
+              }.to_json
+            )
+            conn.zadd(
+              'schedule',
+              1.day.from_now.to_f,
+              {
+                'class' => 'ActiveJob::QueueAdapters::SidekiqAdapter::JobWrapper',
+                'wrapped' => 'Users::Digests::Yearly::EmailSendingJob',
+                'queue' => 'mailers',
+                'args' => [{ 'job_class' => 'Users::Digests::Yearly::EmailSendingJob',
+                             'arguments' => [user.id, 2025] }]
+              }.to_json
+            )
+          end
+        end
+
+        after do
+          Sidekiq.redis { |c| c.del('schedule') }
+        end
+
+        it 'cancels both jobs from the scheduled set' do
+          expect(Sidekiq::ScheduledSet.new.size).to eq(2)
+
+          service.call
+
+          expect(Sidekiq::ScheduledSet.new.size).to eq(0)
+        end
+      end
+
+      context 'when job cancellation fails' do
+        before do
+          allow(Sidekiq::ScheduledSet).to receive(:new).and_raise(StandardError, 'Redis error')
+        end
+
+        it 'logs a warning but continues deletion' do
+          allow(Rails.logger).to receive(:warn)
+          allow(Rails.logger).to receive(:info)
+          allow(Rails.logger).to receive(:error)
+          allow(ExceptionReporter).to receive(:call)
+
+          expect { service.call }.not_to raise_error
+
+          expect(Rails.logger).to have_received(:warn).with(/Failed to cancel scheduled jobs/)
+          expect(ExceptionReporter).to have_received(:call)
+        end
+      end
+    end
+
+    context 'with cache cleanup' do
+      before do
+        # Populate cache with user data
+        Rails.cache.write("dawarich/user_#{user.id}_countries_visited", %w[US CA])
+        Rails.cache.write("dawarich/user_#{user.id}_cities_visited", %w[NYC SF])
+        Rails.cache.write("dawarich/user_#{user.id}_years_tracked", [2023, 2024])
+      end
+
+      it 'clears all user-specific cache keys' do
+        service.call
+
+        expect(Rails.cache.read("dawarich/user_#{user.id}_countries_visited")).to be_nil
+        expect(Rails.cache.read("dawarich/user_#{user.id}_cities_visited")).to be_nil
+        expect(Rails.cache.read("dawarich/user_#{user.id}_years_tracked")).to be_nil
+      end
+
+      it 'logs cache cleanup' do
+        allow(Rails.logger).to receive(:info)
+
+        service.call
+
+        expect(Rails.logger).to have_received(:info).with("Cleared cache for user #{user.id}")
+      end
+
+      context 'when cache cleanup fails' do
+        before do
+          allow(Rails.cache).to receive(:delete).and_raise(StandardError, 'Cache error')
+        end
+
+        it 'logs a warning but completes deletion' do
+          allow(Rails.logger).to receive(:warn)
+
+          expect { service.call }.not_to raise_error
+
+          expect(Rails.logger).to have_received(:warn).with(/Failed to clear cache/)
+        end
+      end
+    end
+
+    context 'with areas and visits (foreign key constraint)' do
+      let!(:area) { create(:area, user:) }
+      let!(:visit) { create(:visit, user:, area:) }
+
+      it 'deletes visits before areas to respect foreign key constraints' do
+        user_id = user.id
+        area_id = area.id
+        visit_id = visit.id
+
+        service.call
+
+        # Both should be deleted successfully
+        expect(Visit.where(id: visit_id).count).to eq(0)
+        expect(Area.where(id: area_id).count).to eq(0)
+        expect(User.unscoped.where(id: user_id).count).to eq(0)
+      end
+    end
+
+    context 'with place_visits referencing visits (foreign key constraint)' do
+      let!(:area) { create(:area, user:) }
+      let!(:place) { create(:place, user:) }
+      let!(:visit) { create(:visit, user:, area:) }
+      let!(:place_visit) { create(:place_visit, place:, visit:) }
+
+      it 'deletes place_visits before visits to respect foreign key constraints' do
+        place_visit_id = place_visit.id
+        visit_id = visit.id
+
+        service.call
+
+        expect(PlaceVisit.where(id: place_visit_id).count).to eq(0)
+        expect(Visit.where(id: visit_id).count).to eq(0)
+      end
+
+      it "removes another user's links to the deleted user's place" do
+        other_user = create(:user)
+        direct_visit = create(:visit, user: other_user, place:)
+        suggested_visit = create(:visit, user: other_user)
+        other_place_visit = create(:place_visit, place:, visit: suggested_visit)
+
+        expect { service.call }.not_to raise_error
+
+        expect(PlaceVisit.where(id: other_place_visit.id)).not_to exist
+        expect(Visit.where(id: [direct_visit.id, suggested_visit.id]).count).to eq(2)
+        expect(direct_visit.reload.place_id).to be_nil
+      end
+    end
+
+    context 'with family associations' do
+      context 'when user owns a family with other members' do
+        let(:family) { create(:family, creator: user) }
+        let(:other_member) { create(:user) }
+
+        before do
+          # User creates and owns a family
+          create(:family_membership, user: user, family: family, role: :owner)
+          # Another user is a member of that family
+          create(:family_membership, user: other_member, family: family, role: :member)
+        end
+
+        it 'aborts deletion and raises error' do
+          expect { service.call }.to raise_error(
+            ActiveRecord::RecordInvalid,
+            /Cannot delete user who owns a family with other members/
+          )
+
+          # User should NOT be deleted
+          expect(User.unscoped.where(id: user.id).count).to eq(1)
+          expect(user.reload.deleted?).to be true # Still soft-deleted
+
+          # Family and memberships should still exist
+          expect(Family.where(id: family.id).count).to eq(1)
+          expect(Family::Membership.where(family_id: family.id).count).to eq(2)
+        end
+
+        it 'logs the validation failure' do
+          allow(Rails.logger).to receive(:warn)
+
+          expect { service.call }.to raise_error(ActiveRecord::RecordInvalid)
+
+          expect(Rails.logger).to have_received(:warn).with(
+            /Cannot delete user who owns a family with other members: user_id=#{user.id}/
+          )
+        end
+      end
+
+      context 'when user owns a family with no other members' do
+        let(:family) { create(:family, creator: user) }
+
+        before do
+          # User creates and owns a family but is the only member
+          create(:family_membership, user: user, family: family, role: :owner)
+        end
+
+        it 'deletes the user, membership, and family' do
+          user_id = user.id
+          family_id = family.id
+
+          service.call
+
+          # User should be deleted
+          expect(User.unscoped.where(id: user_id).count).to eq(0)
+
+          # All family memberships should be deleted
+          expect(Family::Membership.where(family_id: family_id).count).to eq(0)
+
+          # Family itself should be deleted
+          expect(Family.where(id: family_id).count).to eq(0)
+        end
+      end
+    end
+
+    context 'with user as family member only' do
+      it 'deletes member but preserves family and owner' do
+        # Create separate users (not using the `user` from parent context)
+        family_owner = create(:user)
+        member_user = create(:user)
+        member_user.mark_as_deleted!
+
+        a_family = create(:family, creator: family_owner)
+        create(:family_membership, user: family_owner, family: a_family, role: :owner)
+        create(:family_membership, user: member_user, family: a_family, role: :member)
+
+        member_service = described_class.new(member_user)
+        member_user_id = member_user.id
+        family_id = a_family.id
+
+        member_service.call
+
+        # Member user should be deleted
+        expect(User.unscoped.where(id: member_user_id).count).to eq(0)
+
+        # Member's membership should be deleted
+        expect(Family::Membership.where(family_id: family_id, user_id: member_user_id).count).to eq(0)
+
+        # But family should still exist (owned by family_owner)
+        expect(Family.where(id: family_id).count).to eq(1)
+
+        # And owner's membership should still exist
+        expect(Family::Membership.where(family_id: family_id, user_id: family_owner.id).count).to eq(1)
+      end
+    end
+
+    context 'when deletion fails' do
+      before do
+        allow(user.points).to receive(:delete_all).and_raise(StandardError, 'Database constraint violation')
+      end
+
+      it 'lets the exception propagate to the caller' do
+        expect { service.call }.to raise_error(StandardError, 'Database constraint violation')
+      end
+    end
+
+    context 'with ActiveStorage attachments' do
+      let!(:import_record) { create(:import, user:) }
+
+      before do
+        import_record.file.attach(
+          io: StringIO.new('test'),
+          filename: 'test.gpx',
+          content_type: 'application/gpx+xml'
+        )
+      end
+
+      it 'purges attachment blobs' do
+        blob = import_record.file.blob
+
+        service.call
+
+        expect(ActiveStorage::Blob.exists?(blob.id)).to be false
+      end
+
+      context 'when attachment purging fails' do
+        before do
+          allow(ActiveStorage::Attachment).to receive(:where).and_raise(StandardError, 'S3 unavailable')
+        end
+
+        it 'reports the exception and continues deletion' do
+          allow(Rails.logger).to receive(:warn)
+          allow(Rails.logger).to receive(:info)
+          allow(ExceptionReporter).to receive(:call)
+
+          expect { service.call }.not_to raise_error
+
+          expect(Rails.logger).to have_received(:warn).with(/Failed to purge Import attachments/)
+          expect(ExceptionReporter).to have_received(:call).with(
+            instance_of(StandardError),
+            /Failed to purge Import attachments/
+          )
+        end
+      end
+    end
+
+    context 'with taggings referencing tags (foreign key constraint)' do
+      let!(:tag) { create(:tag, user:) }
+      let!(:place) { create(:place, user:) }
+      let!(:tagging) { create(:tagging, tag:, taggable: place) }
+
+      it 'deletes taggings before tags to respect foreign key constraints' do
+        user_id = user.id
+        tag_id = tag.id
+        tagging_id = tagging.id
+
+        service.call
+
+        expect(Tagging.where(id: tagging_id).count).to eq(0)
+        expect(Tag.where(id: tag_id).count).to eq(0)
+        expect(User.unscoped.where(id: user_id).count).to eq(0)
+      end
+    end
+
+    context 'with track_segments referencing tracks (foreign key constraint)' do
+      let!(:track) { create(:track, user:) }
+      let!(:segment) { create(:track_segment, track:) }
+
+      it 'deletes track_segments before tracks to respect foreign key constraints' do
+        user_id = user.id
+        track_id = track.id
+        segment_id = segment.id
+
+        service.call
+
+        expect(TrackSegment.where(id: segment_id).count).to eq(0)
+        expect(Track.where(id: track_id).count).to eq(0)
+        expect(User.unscoped.where(id: user_id).count).to eq(0)
+      end
+    end
+
+    context 'with family location requests' do
+      let(:family) { create(:family, creator: user) }
+      let(:other_user) { create(:user) }
+
+      before do
+        create(:family_membership, user:, family:, role: :owner)
+        create(:family_membership, user: other_user, family:, role: :member)
+      end
+
+      it 'deletes location requests where user is requester' do
+        request = create(:family_location_request, requester: user, target_user: other_user, family:)
+
+        # Remove other member so deletion is allowed
+        Family::Membership.where(user_id: other_user.id).delete_all
+
+        service.call
+
+        expect(Family::LocationRequest.where(id: request.id).count).to eq(0)
+        expect(User.unscoped.where(id: user.id).count).to eq(0)
+      end
+
+      it 'deletes location requests where user is target' do
+        request = create(:family_location_request, requester: other_user, target_user: user, family:)
+
+        # Remove other member so deletion is allowed
+        Family::Membership.where(user_id: other_user.id).delete_all
+
+        service.call
+
+        expect(Family::LocationRequest.where(id: request.id).count).to eq(0)
+        expect(User.unscoped.where(id: user.id).count).to eq(0)
+      end
+    end
+
+    context 'with large datasets' do
+      before do
+        # Create many points to simulate a real user with lots of data
+        create_list(:point, 100, user:)
+      end
+
+      it 'successfully deletes all records' do
+        expect { service.call }.to change { Point.where(user_id: user.id).count }.from(100).to(0)
+      end
+
+      it 'completes deletion' do
+        service.call
+
+        expect(Point.where(user_id: user.id).count).to eq(0)
+        expect(User.unscoped.find_by(id: user.id)).to be_nil
+      end
+    end
+  end
+
+  it 'deletes retained placeless events and deliveries with their user', :place_retention do
+    user = create(:user)
+    event = create(:geofence_event, user:, place: nil, place_name: 'Former home')
+    delivery = create(:webhook_delivery, webhook: create(:webhook, user:), geofence_event: event)
+    user.mark_as_deleted!
+
+    described_class.new(user).call
+
+    expect(GeofenceEvent.exists?(event.id)).to be(false)
+    expect(WebhookDelivery.exists?(delivery.id)).to be(false)
+  end
+end

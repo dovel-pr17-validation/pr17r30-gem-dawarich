@@ -1,0 +1,34 @@
+# frozen_string_literal: true
+
+# Pin npm packages by running ./bin/importmap
+
+pin_all_from 'app/javascript/channels', under: 'channels'
+pin_all_from 'app/javascript/maps_maplibre', under: 'maps_maplibre'
+
+pin 'application', preload: true
+pin 'i18n', preload: true
+pin '@rails/actioncable', to: 'actioncable.esm.js'
+pin '@rails/activestorage', to: 'activestorage.esm.js'
+pin '@rails/ujs', to: 'rails-ujs.js'
+pin '@hotwired/turbo-rails', to: 'turbo.min.js', preload: true
+pin '@hotwired/stimulus', to: 'stimulus.min.js', preload: true
+pin '@hotwired/stimulus-loading', to: 'stimulus-loading.js', preload: true
+pin_all_from 'app/javascript/controllers', under: 'controllers'
+pin_all_from 'app/javascript/services', under: 'services'
+pin_all_from 'app/javascript/achievements', under: 'achievements'
+pin_all_from 'app/javascript/poster_studio', under: 'poster_studio'
+pin_all_from 'app/javascript/video_studio', under: 'video_studio'
+
+pin 'chartkick', to: 'chartkick.js'
+pin 'Chart.bundle', to: 'Chart.bundle.js'
+pin 'notifications_channel', to: 'channels/notifications_channel.js'
+pin 'imports_channel', to: 'channels/imports_channel.js'
+pin 'family_locations_channel', to: 'channels/family_locations_channel.js'
+pin 'trix'
+pin '@rails/actiontext', to: 'actiontext.esm.js'
+pin 'emoji-mart' # @5.6.0
+pin 'maplibre-gl', to: '/maplibre/6.16.0/maplibre-gl.mjs' # ESM module and worker are served together
+pin 'fflate' # @0.8.2
+pin 'pmtiles', to: 'pmtiles.js' # @4.5.0, vendored for offline maps
+pin 'h3-js' # @4.4.0
+pin 'mp4-muxer' # @5.2.2

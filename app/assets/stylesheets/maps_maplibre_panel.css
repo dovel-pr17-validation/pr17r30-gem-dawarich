@@ -1,0 +1,957 @@
+/* Maps V2 Control Panel Styles */
+
+.map-control-panel {
+  position: absolute;
+  top: 0;
+  left: -480px; /* Hidden off-screen to the left */
+  width: 480px;
+  height: 100%;
+  background: oklch(var(--b1));
+  border-right: 1px solid oklch(var(--bc) / 0.1);
+  z-index: 9999;
+  transition: left 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  display: flex;
+  flex-direction: column; /* Single column — the floating cluster on the
+                             panel's right edge serves as the tab strip
+                             whether the panel is open or closed. */
+  overflow: hidden;
+}
+
+.map-control-panel.open {
+  left: 0;
+}
+
+/* Shrink map when panel is open */
+.maps-maplibre-container {
+  transition:
+    width 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+    margin-left 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+:is(
+    html[aria-busy="true"] #maps-maplibre-container,
+    #maps-maplibre-container:not([data-sidebar-layout-ready])
+  )
+  > :is(.maps-maplibre-container, .map-button-cluster, .replay-panel) {
+  transition: none;
+}
+
+.maps-maplibre-container.panel-open {
+  margin-left: 480px;
+  width: calc(100% - 480px) !important;
+}
+
+/* Vertical Tab Bar (now on the right side of the panel) */
+.panel-tabs {
+  width: 64px;
+  background: oklch(var(--b2));
+  border-left: 1px solid oklch(var(--bc) / 0.1);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 16px 0;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.tab-btn {
+  width: 48px;
+  height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  transition: all 0.2s;
+  position: relative;
+  color: oklch(var(--bc) / 0.6);
+}
+
+.tab-btn:hover {
+  background: oklch(var(--b3));
+  color: oklch(var(--bc));
+}
+
+.tab-btn.active {
+  background: oklch(var(--p));
+  color: oklch(var(--pc));
+}
+
+.tab-btn.active::after {
+  display: none;
+}
+
+.tab-icon {
+  width: 24px;
+  height: 24px;
+}
+
+/* Panel Content (now on the left side) */
+.panel-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-width: 0;
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 20px 24px;
+  border-bottom: 1px solid oklch(var(--bc) / 0.1);
+  background: oklch(var(--b1));
+  flex-shrink: 0;
+}
+
+.panel-title {
+  font-size: 1.25rem;
+  font-weight: 600;
+  margin: 0;
+  color: oklch(var(--bc));
+}
+
+.panel-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px;
+}
+
+/* Tab Content */
+.tab-content {
+  display: none;
+}
+
+.tab-content.active {
+  display: block;
+}
+
+/* Custom Scrollbar */
+.panel-body::-webkit-scrollbar {
+  width: 8px;
+}
+
+.panel-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.panel-body::-webkit-scrollbar-thumb {
+  background: oklch(var(--bc) / 0.2);
+  border-radius: 4px;
+}
+
+.panel-body::-webkit-scrollbar-thumb:hover {
+  background: oklch(var(--bc) / 0.3);
+}
+
+[type="checkbox"].toggle:focus,
+[type="checkbox"].toggle:focus-visible,
+[type="checkbox"].toggle:focus-within,
+[type="checkbox"].toggle:checked,
+[type="checkbox"].toggle:checked:focus,
+[type="checkbox"].toggle:checked:focus-visible,
+[type="checkbox"].toggle:checked:hover,
+[type="checkbox"].toggle:active,
+[type="checkbox"].toggle:active:focus {
+  outline: none;
+  background-image: none;
+  box-shadow:
+    var(--handleoffsetcalculator) 0 0 2px var(--tglbg) inset,
+    0 0 0 2px var(--tglbg) inset,
+    var(--togglehandleborder);
+  --tw-ring-shadow: 0 0 transparent;
+  --tw-ring-offset-shadow: 0 0 transparent;
+}
+
+[type="checkbox"].toggle-primary:checked,
+[type="checkbox"].toggle-primary:checked:focus,
+[type="checkbox"].toggle-primary:checked:focus-visible,
+[type="checkbox"].toggle-primary:checked:hover {
+  background-color: oklch(var(--p));
+  border-color: oklch(var(--p) / 0.1);
+}
+
+[type="checkbox"].toggle-secondary:checked,
+[type="checkbox"].toggle-secondary:checked:focus,
+[type="checkbox"].toggle-secondary:checked:focus-visible,
+[type="checkbox"].toggle-secondary:checked:hover {
+  background-color: oklch(var(--s));
+  border-color: oklch(var(--s) / 0.1);
+}
+
+[type="checkbox"].toggle-accent:checked,
+[type="checkbox"].toggle-accent:checked:focus,
+[type="checkbox"].toggle-accent:checked:focus-visible,
+[type="checkbox"].toggle-accent:checked:hover {
+  background-color: oklch(var(--a));
+  border-color: oklch(var(--a) / 0.1);
+}
+
+[type="checkbox"].toggle-success:checked,
+[type="checkbox"].toggle-success:checked:focus,
+[type="checkbox"].toggle-success:checked:focus-visible,
+[type="checkbox"].toggle-success:checked:hover {
+  background-color: oklch(var(--su));
+  border-color: oklch(var(--su) / 0.1);
+}
+
+[type="checkbox"].toggle-warning:checked,
+[type="checkbox"].toggle-warning:checked:focus,
+[type="checkbox"].toggle-warning:checked:focus-visible,
+[type="checkbox"].toggle-warning:checked:hover {
+  background-color: oklch(var(--wa));
+  border-color: oklch(var(--wa) / 0.1);
+}
+
+[type="checkbox"].toggle-error:checked,
+[type="checkbox"].toggle-error:checked:focus,
+[type="checkbox"].toggle-error:checked:focus-visible,
+[type="checkbox"].toggle-error:checked:hover {
+  background-color: oklch(var(--er));
+  border-color: oklch(var(--er) / 0.1);
+}
+
+[type="checkbox"].toggle-info:checked,
+[type="checkbox"].toggle-info:checked:focus,
+[type="checkbox"].toggle-info:checked:focus-visible,
+[type="checkbox"].toggle-info:checked:hover {
+  background-color: oklch(var(--in));
+  border-color: oklch(var(--in) / 0.1);
+}
+
+.toggle:indeterminate {
+  opacity: 1;
+}
+
+/* Responsive Breakpoints */
+
+/* Large tablets and smaller desktops (1024px - 1280px) */
+@media (max-width: 1280px) {
+  .map-control-panel {
+    width: 420px;
+    left: -420px;
+  }
+  .maps-maplibre-container.panel-open {
+    margin-left: 420px;
+    width: calc(100% - 420px) !important;
+  }
+}
+
+/* Tablets (768px - 1024px) */
+@media (max-width: 1024px) {
+  .map-control-panel {
+    width: 380px;
+    left: -380px;
+  }
+  .maps-maplibre-container.panel-open {
+    margin-left: 380px;
+    width: calc(100% - 380px) !important;
+  }
+  .panel-body {
+    padding: 20px;
+  }
+}
+
+/* Small tablets and large phones (640px - 768px) */
+@media (max-width: 768px) {
+  .map-control-panel {
+    width: 95%;
+    left: -95%;
+    max-width: 480px;
+  }
+  /* On mobile, overlay instead of shrink */
+  .maps-maplibre-container.panel-open {
+    margin-left: 0;
+    width: calc(100% - var(--map-panel-offset, 0px)) !important;
+  }
+  .panel-header {
+    padding: 16px 20px;
+  }
+  .panel-title {
+    font-size: 1.125rem;
+  }
+  .panel-body {
+    padding: 16px 20px;
+  }
+}
+
+/* Mobile phones (< 640px) */
+@media (max-width: 640px) {
+  .map-control-panel {
+    width: 100%;
+    left: -100%;
+    max-width: none;
+  }
+
+  .panel-tabs {
+    width: 56px;
+    padding: 12px 0;
+    gap: 6px;
+  }
+
+  .tab-btn {
+    width: 44px;
+    height: 44px;
+  }
+
+  .tab-icon {
+    width: 20px;
+    height: 20px;
+  }
+
+  .panel-header {
+    padding: 14px 16px;
+  }
+
+  .panel-title {
+    font-size: 1rem;
+  }
+
+  .panel-body {
+    padding: 16px;
+  }
+
+  /* Reduce spacing on mobile */
+  .space-y-4 > * + * {
+    margin-top: 0.75rem;
+  }
+
+  .space-y-6 > * + * {
+    margin-top: 1rem;
+  }
+}
+
+/* Very small phones (< 375px) */
+@media (max-width: 375px) {
+  .panel-tabs {
+    width: 52px;
+    padding: 10px 0;
+  }
+
+  .tab-btn {
+    width: 40px;
+    height: 40px;
+  }
+
+  .panel-header {
+    padding: 12px;
+  }
+
+  .panel-body {
+    padding: 12px;
+  }
+}
+
+/* ===== Timeline tab expanded panel ===== */
+/* When the Timeline tab is active, the panel widens so the unified
+   calendar + visit list can breathe. Matching `.panel-timeline-expanded`
+   on the map container keeps the map offset so nothing is obscured. */
+
+.map-control-panel.timeline-expanded {
+  width: 720px;
+  left: -720px;
+}
+
+.map-control-panel.timeline-expanded.open {
+  left: 0;
+}
+
+.maps-maplibre-container.panel-timeline-expanded {
+  margin-left: 720px;
+  width: calc(100% - 720px) !important;
+}
+
+@media (max-width: 1280px) {
+  .map-control-panel.timeline-expanded {
+    width: 620px;
+    left: -620px;
+  }
+  .maps-maplibre-container.panel-timeline-expanded {
+    margin-left: 620px;
+    width: calc(100% - 620px) !important;
+  }
+}
+
+@media (max-width: 1024px) {
+  .map-control-panel.timeline-expanded {
+    width: 520px;
+    left: -520px;
+  }
+  .maps-maplibre-container.panel-timeline-expanded {
+    margin-left: 520px;
+    width: calc(100% - 520px) !important;
+  }
+}
+
+@media (max-width: 768px) {
+  .map-control-panel.timeline-expanded {
+    width: 95%;
+    left: -95%;
+    max-width: 620px;
+  }
+  /* On mobile, overlay the map instead of shrinking it. */
+  .maps-maplibre-container.panel-timeline-expanded {
+    margin-left: 0;
+    width: calc(100% - var(--map-panel-offset, 0px)) !important;
+  }
+}
+
+/* Respect user motion preferences — cap panel/map transitions. */
+@media (prefers-reduced-motion: reduce) {
+  .map-control-panel,
+  .maps-maplibre-container {
+    transition-duration: 50ms !important;
+  }
+}
+
+/* ===== Map edge button cluster =====
+   The cluster sits 12px off the panel's RIGHT edge, so it tracks with the
+   panel as it slides:
+     - panel closed (panel.left = -480px → panel.right = 0): cluster at 12px
+       (top-left of the map area, looks like a floating tab launcher)
+     - panel open (panel.left = 0 → panel.right = 480/720): cluster at
+       492/732px (visually attached to the panel, looks like the panel's
+       tab strip)
+   Removes the need for the old in-panel `.panel-tabs` element since the
+   cluster itself is the tab strip in both states. */
+.map-button-cluster {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 500;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: oklch(var(--b1) / 0.95);
+  backdrop-filter: blur(6px);
+  border: 1px solid oklch(var(--bc) / 0.15);
+  border-radius: 8px;
+  padding: 6px;
+  transition: left 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  max-height: calc(100% - 24px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+}
+
+.map-button-cluster::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+.maps-maplibre-container.panel-open ~ .map-button-cluster {
+  left: 492px;
+}
+
+.maps-maplibre-container.panel-timeline-expanded ~ .map-button-cluster {
+  left: 732px;
+}
+
+@media (max-width: 1280px) {
+  .maps-maplibre-container.panel-open ~ .map-button-cluster {
+    left: 432px;
+  }
+  .maps-maplibre-container.panel-timeline-expanded ~ .map-button-cluster {
+    left: 632px;
+  }
+}
+
+@media (max-width: 1024px) {
+  .maps-maplibre-container.panel-open ~ .map-button-cluster {
+    left: 392px;
+  }
+  .maps-maplibre-container.panel-timeline-expanded ~ .map-button-cluster {
+    left: 532px;
+  }
+}
+
+/* On mobile the panel overlays the map — keep the cluster pinned to the
+   left edge so users can dismiss the panel by tapping a cluster button. */
+@media (max-width: 768px) {
+  .maps-maplibre-container.panel-open ~ .map-button-cluster,
+  .maps-maplibre-container.panel-timeline-expanded ~ .map-button-cluster {
+    left: 12px;
+  }
+}
+
+.map-button-cluster__btn {
+  position: relative;
+  width: 40px;
+  height: 40px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  background: oklch(var(--b1));
+  border-radius: 6px;
+  cursor: pointer;
+  color: oklch(var(--bc) / 0.75);
+}
+
+.map-button-cluster__btn:hover {
+  background: color-mix(in oklab, oklch(var(--bc)) 6%, oklch(var(--b1)));
+  color: oklch(var(--bc));
+}
+
+.map-button-cluster__btn:focus-visible {
+  outline: 2px solid oklch(var(--p));
+  outline-offset: 1px;
+}
+
+.map-button-cluster__btn--active {
+  background: oklch(var(--p));
+  color: oklch(var(--pc));
+}
+
+.map-button-cluster__btn--active:hover {
+  background: oklch(var(--p));
+  color: oklch(var(--pc));
+}
+
+.map-button-cluster__btn--create {
+  color: #22c55e;
+}
+
+.map-button-cluster__btn--create:hover {
+  background: color-mix(in oklab, #22c55e 12%, oklch(var(--b1)));
+  color: #22c55e;
+}
+
+/* When Create is the active tab, the green icon-on-blue ends up low
+   contrast. Lean into the create accent color for the active state too —
+   green background, white glyph — so the active state reads cleanly and
+   keeps the button's semantic color. Higher-specificity selector wins
+   over the generic `--active` rule above. */
+.map-button-cluster__btn--create.map-button-cluster__btn--active,
+.map-button-cluster__btn--create.map-button-cluster__btn--active:hover {
+  background: #22c55e;
+  color: white;
+}
+
+.map-button-cluster__btn--muted {
+  opacity: 0.6;
+}
+
+.map-button-cluster__btn--muted:hover {
+  opacity: 1;
+}
+
+.map-button-cluster__btn svg {
+  width: 20px;
+  height: 20px;
+}
+
+.map-button-cluster__divider {
+  height: 1px;
+  flex: none;
+  background: oklch(var(--bc) / 0.1);
+  margin: 2px 4px;
+}
+
+.map-button-cluster__badge {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 9999px;
+  background: #f59e0b;
+  color: white;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+  border: 1.5px solid oklch(var(--b1));
+  white-space: nowrap;
+}
+
+/* Point edit history — floating map chrome, flat at rest. */
+.map-edit-history {
+  width: 19rem;
+  max-width: calc(100vw - 24px);
+  overflow: hidden;
+  color: oklch(var(--bc));
+  font-size: 0.875rem;
+  background: oklch(var(--b1) / 0.95);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  border: 1px solid oklch(var(--bc) / 0.15);
+  border-radius: 8px;
+}
+
+.map-edit-history__header {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 6px 6px 12px;
+  border-bottom: 1px solid oklch(var(--bc) / 0.1);
+}
+
+.map-edit-history[aria-busy="true"] .map-edit-history__header::after {
+  content: "";
+  position: absolute;
+  bottom: -1px;
+  left: 0;
+  width: 40%;
+  height: 2px;
+  background: oklch(var(--p));
+  animation: map-edit-history-saving 1.1s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+@keyframes map-edit-history-saving {
+  from {
+    transform: translateX(-100%);
+  }
+
+  to {
+    transform: translateX(250%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .map-edit-history[aria-busy="true"] .map-edit-history__header::after {
+    width: 100%;
+    opacity: 0.5;
+    animation: none;
+  }
+}
+
+.map-edit-history__title {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  hyphens: auto;
+  hyphenate-limit-chars: 12 5 5;
+  overflow-wrap: anywhere;
+}
+
+.map-edit-history__capacity {
+  flex: none;
+  color: oklch(var(--bc) / 0.6);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.map-edit-history__actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 2px;
+}
+
+.map-edit-history__divider {
+  width: 1px;
+  height: 16px;
+  margin: 0 4px;
+  background: oklch(var(--bc) / 0.15);
+}
+
+.map-edit-history__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  color: oklch(var(--bc) / 0.75);
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+  transition:
+    background-color 150ms ease,
+    color 150ms ease;
+}
+
+.map-edit-history__icon:hover:not(:disabled) {
+  color: oklch(var(--bc));
+  background: oklch(var(--bc) / 0.08);
+}
+
+.map-edit-history__icon:disabled {
+  color: oklch(var(--bc) / 0.25);
+  cursor: default;
+}
+
+.map-edit-history button:focus-visible {
+  outline: 2px solid oklch(var(--p));
+  outline-offset: 1px;
+}
+
+.map-edit-history__list {
+  max-height: 14rem;
+  margin: 0;
+  padding: 4px 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.map-edit-history__entry {
+  position: relative;
+}
+
+.map-edit-history__entry::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 16px;
+  width: 1px;
+  background: oklch(var(--bc) / 0.12);
+}
+
+.map-edit-history__entry:first-child::before {
+  top: 50%;
+}
+
+.map-edit-history__entry:last-child::before {
+  bottom: 50%;
+}
+
+.map-edit-history__entry:only-child::before {
+  display: none;
+}
+
+.map-edit-history__step {
+  position: relative;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: baseline;
+  column-gap: 8px;
+  width: 100%;
+  min-height: 32px;
+  padding: 6px 12px 6px 30px;
+  color: inherit;
+  font-variant-numeric: tabular-nums;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  transition: background-color 150ms ease;
+}
+
+.map-edit-history__step:hover:not(:disabled) {
+  background: oklch(var(--bc) / 0.06);
+}
+
+.map-edit-history__step:disabled {
+  cursor: progress;
+}
+
+.map-edit-history__step::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 13px;
+  width: 7px;
+  height: 7px;
+  margin-top: -3.5px;
+  background: oklch(var(--bc) / 0.45);
+  border-radius: 50%;
+}
+
+.map-edit-history__distance {
+  font-weight: 600;
+}
+
+.map-edit-history__point,
+.map-edit-history__time {
+  color: oklch(var(--bc) / 0.6);
+  font-size: 0.75rem;
+}
+
+.map-edit-history__point {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.map-edit-history__entry[data-state="current"] .map-edit-history__step::before {
+  left: 12px;
+  width: 9px;
+  height: 9px;
+  margin-top: -4.5px;
+  background: oklch(var(--p));
+}
+
+.map-edit-history__entry[data-state="undone"] .map-edit-history__step {
+  color: oklch(var(--bc) / 0.5);
+}
+
+.map-edit-history__entry[data-state="undone"] .map-edit-history__step::before {
+  background: oklch(var(--b1));
+  border: 1.5px solid oklch(var(--bc) / 0.35);
+}
+
+@media (pointer: coarse) {
+  .map-edit-history__icon {
+    width: 36px;
+    height: 36px;
+  }
+
+  .map-edit-history__step {
+    min-height: 40px;
+  }
+}
+
+/* Trip plan — numbered stop markers and the caption that names the map. */
+.trip-plan-marker {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  background: var(--trip-plan-marker-color, oklch(var(--p)));
+  border: 2px solid #ffffff;
+  border-radius: 50%;
+  cursor: default;
+}
+
+.trip-plan-caption {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: calc(100% - 24px);
+  padding: 6px 10px;
+  color: oklch(var(--bc));
+  font-size: 0.8125rem;
+  background: oklch(var(--b1) / 0.95);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  border: 1px solid oklch(var(--bc) / 0.15);
+  border-radius: 8px;
+}
+
+.trip-plan-caption--compact {
+  top: 8px;
+  left: 8px;
+  padding: 2px 8px;
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+
+/* Layers tab: one tile per layer, options for the enabled layers below */
+.layer-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(7.5rem, 1fr));
+  gap: 8px;
+}
+
+.layer-tile {
+  position: relative;
+  display: grid;
+  justify-items: center;
+  align-content: center;
+  gap: 6px;
+  min-height: 76px;
+  padding: 14px 8px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--rounded-box, 0.625rem);
+  background-color: oklch(var(--b1));
+  text-align: center;
+  cursor: pointer;
+}
+
+.layer-tile:hover {
+  background-color: color-mix(in oklab, oklch(var(--bc)) 4%, oklch(var(--b1)));
+}
+
+.layer-tile__input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.layer-tile:has(.layer-tile__input:focus-visible) {
+  outline: 2px solid oklch(var(--p));
+  outline-offset: 1px;
+}
+
+.layer-tile:has(.layer-tile__input:checked) {
+  background-color: color-mix(in oklab, oklch(var(--p)) 12%, oklch(var(--b1)));
+}
+
+.layer-tile:has(.layer-tile__input:disabled) {
+  opacity: 0.4;
+  cursor: not-allowed;
+  box-shadow: none;
+  transform: none;
+}
+
+.layer-tile__icon {
+  width: 20px;
+  height: 20px;
+  color: oklch(var(--bc) / 0.75);
+}
+
+.layer-tile:has(.layer-tile__input:checked) .layer-tile__icon {
+  color: oklch(var(--p));
+}
+
+.layer-tile__label {
+  font-size: 0.75rem;
+  font-weight: 500;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+  hyphens: auto;
+}
+
+.layer-tile__badge {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  z-index: 1;
+  line-height: 1;
+}
+
+[data-tab-content="layers"]:has(
+    [data-maps--maplibre-target="pointsToggle"]:not(:checked)
+  )
+  [data-layer-options="points"] {
+  display: none;
+}
+
+[data-tab-content="layers"]:has(
+    [data-maps--maplibre-target="fogToggle"]:not(:checked)
+  )
+  [data-layer-options="fog"] {
+  display: none;
+}
+
+.layer-options {
+  display: grid;
+  gap: 16px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid oklch(var(--bc) / 0.1);
+}
+
+.layer-options__label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: oklch(var(--bc) / 0.55);
+}

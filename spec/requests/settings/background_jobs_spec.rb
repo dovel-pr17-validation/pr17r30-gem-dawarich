@@ -1,0 +1,289 @@
+# frozen_string_literal: true
+
+require 'rails_helper'
+
+RSpec.describe '/settings/background_jobs', type: :request do
+  context 'when Dawarich is in self-hosted mode' do
+    before do
+      allow(DawarichSettings).to receive(:self_hosted?).and_return(true)
+    end
+
+    context 'when user is not authenticated' do
+      it 'redirects to sign in page' do
+        get settings_background_jobs_url
+
+        expect(response).to redirect_to(new_user_session_url)
+      end
+    end
+
+    context 'when user is authenticated' do
+      let(:user) { create(:user, admin: false) }
+
+      before { sign_in user }
+
+      it 'stores JSON booleans as strings and leaves the opt-in unchanged on a blank PATCH' do
+        [[true, true], [false, false], [nil, false], ['', false]].each do |value, expected|
+          patch settings_background_jobs_url, params: { settings: { visits_suggestions_enabled: value } }, as: :json
+
+          expect(response).to redirect_to(settings_background_jobs_url)
+          expect(user.reload.settings['visits_suggestions_enabled']).to eq(expected.to_s)
+          expect(user.safe_settings.visits_suggestions_enabled?).to be(expected)
+        end
+      end
+
+      it 'shows the current visit suggestion state and PATCHes the opposite action in every locale' do
+        labels = {
+          'en' => %w[Enabled Disabled Disable Enable],
+          'de' => %w[Aktiviert Deaktiviert Deaktivieren Aktivieren],
+          'es' => %w[Habilitadas Deshabilitadas Deshabilitar Habilitar],
+          'fr' => %w[Activées Désactivées Désactiver Activer],
+          'ca' => %w[Activats Desactivats Desactiva Activa],
+          'pl' => %w[Włączone Wyłączone Wyłącz Włącz],
+          'zh' => %w[已启用 已禁用 禁用 启用]
+        }
+
+        labels.each do |locale, (on, off, disable, enable)|
+          [true, false].each do |enabled|
+            user.update!(settings: { 'locale' => locale, 'visits_suggestions_enabled' => enabled })
+            get settings_background_jobs_url
+
+            expect(response).to be_successful
+            expect(response.body).not_to include('translation missing:')
+            card = Nokogiri::HTML(response.body).at_css('[data-testid="visits-suggestions-card"]')
+            expect(card).to be_present
+            if locale == 'en'
+              expect(card.text).to include('shortly after new points arrive', 're-checked every night',
+                                           'Disabling them stops all automatic visit detection')
+            end
+            expect(card.at_css('[role="status"]').text.strip).to eq(enabled ? on : off)
+            link = card.at_css('a[data-turbo-method="patch"]')
+            expect(link.text.strip).to eq(enabled ? disable : enable)
+            query = Rack::Utils.parse_nested_query(URI.parse(link['href']).query)
+            expect(query.dig('settings', 'visits_suggestions_enabled')).to eq((!enabled).to_s)
+
+            patch link['href']
+
+            expect(response).to redirect_to(settings_background_jobs_url)
+            expect(user.reload.settings['visits_suggestions_enabled']).to eq((!enabled).to_s)
+            expect(user.safe_settings.visits_suggestions_enabled?).to be(!enabled)
+          end
+        end
+      end
+
+      context 'when user is not an admin' do
+        it 'renders a successful response' do
+          get settings_background_jobs_url
+
+          expect(response).to be_successful
+        end
+
+        context 'when job name is start_immich_import' do
+          it 'redirects to imports page' do
+            post settings_background_jobs_url, params: { job_name: 'start_immich_import' }
+
+            expect(response).to redirect_to(imports_url)
+          end
+
+          it 'enqueues a new job' do
+            expect do
+              post settings_background_jobs_url, params: { job_name: 'start_immich_import' }
+            end.to have_enqueued_job(EnqueueBackgroundJob)
+          end
+        end
+
+        context 'when job name is start_photoprism_import' do
+          it 'redirects to imports page' do
+            get settings_background_jobs_url, params: { job_name: 'start_photoprism_import' }
+          end
+
+          it 'enqueues a new job' do
+            expect do
+              post settings_background_jobs_url, params: { job_name: 'start_photoprism_import' }
+            end.to have_enqueued_job(EnqueueBackgroundJob)
+          end
+        end
+        context 'when job name is start_teslamate_sync' do
+          it 'queues the sync and returns to the TeslaMate pane' do
+            expect do
+              post settings_background_jobs_url, params: { job_name: 'start_teslamate_sync' }
+            end.to have_enqueued_job(EnqueueBackgroundJob).with('start_teslamate_sync', user.id)
+
+            expect(response).to redirect_to(settings_integrations_path(service: 'teslamate'))
+          end
+        end
+      end
+
+      context 'when user is an admin' do
+        let(:admin_user) { create(:user, :admin) }
+
+        before { sign_in admin_user }
+
+        describe 'GET /index' do
+          it 'renders a successful response' do
+            get settings_background_jobs_url
+
+            expect(response).to be_successful
+          end
+        end
+
+        describe 'POST /create' do
+          let(:params) { { job_name: 'start_reverse_geocoding' } }
+
+          context 'with valid parameters' do
+            it 'enqueues a new job' do
+              expect do
+                post settings_background_jobs_url, params:
+              end.to have_enqueued_job(EnqueueBackgroundJob)
+            end
+
+            it 'redirects to the created settings_background_job' do
+              post(settings_background_jobs_url, params:)
+
+              expect(response).to redirect_to(settings_background_jobs_url)
+            end
+          end
+        end
+
+        describe 'PATCH /update' do
+          it 'enables visits suggestions' do
+            patch settings_background_jobs_url, params: { settings: { 'visits_suggestions_enabled' => 'true' } }
+
+            expect(response).to redirect_to(settings_background_jobs_url)
+            expect(flash[:notice]).to eq('Settings updated')
+            expect(admin_user.reload.settings['visits_suggestions_enabled']).to eq('true')
+          end
+
+          it 'disables visits suggestions' do
+            patch settings_background_jobs_url, params: { settings: { 'visits_suggestions_enabled' => 'false' } }
+
+            expect(response).to redirect_to(settings_background_jobs_url)
+            expect(admin_user.reload.settings['visits_suggestions_enabled']).to eq('false')
+          end
+        end
+      end
+
+      context 'when non-admin user patches update' do
+        it 'allows the request and updates settings' do
+          patch settings_background_jobs_url, params: { settings: { 'visits_suggestions_enabled' => 'true' } }
+
+          expect(response).to redirect_to(settings_background_jobs_url)
+          expect(flash[:notice]).to eq('Settings updated')
+        end
+      end
+    end
+  end
+
+  context 'when Dawarich is not in self-hosted mode' do
+    before do
+      allow(DawarichSettings).to receive(:self_hosted?).and_return(false)
+    end
+
+    context 'when user is not authenticated' do
+      it 'redirects to sign in page' do
+        get settings_background_jobs_url
+
+        expect(response).to redirect_to(new_user_session_url)
+      end
+    end
+
+    context 'when user is authenticated' do
+      let(:user) { create(:user) }
+
+      before { sign_in user }
+
+      describe 'GET /index' do
+        it 'redirects to root page' do
+          get settings_background_jobs_url
+
+          expect(response).to redirect_to(root_url)
+          expect(flash[:alert]).to eq('You are not authorized to perform this action.')
+        end
+
+        context 'when user is an admin' do
+          before { sign_in create(:user, :admin) }
+
+          it 'redirects to root page' do
+            get settings_background_jobs_url
+
+            expect(response).to redirect_to(root_url)
+            expect(flash[:alert]).to eq('You are not authorized to perform this action.')
+          end
+        end
+      end
+
+      describe 'POST /create' do
+        it 'redirects to root page' do
+          post settings_background_jobs_url, params: { job_name: 'start_reverse_geocoding' }
+
+          expect(response).to redirect_to(root_url)
+          expect(flash[:alert]).to eq('You are not authorized to perform this action.')
+        end
+
+        context 'when job name is start_immich_import' do
+          it 'redirects to imports page' do
+            post settings_background_jobs_url, params: { job_name: 'start_immich_import' }
+
+            expect(response).to redirect_to(imports_url)
+          end
+        end
+
+        context 'when job name is start_photoprism_import' do
+          it 'redirects to imports page' do
+            post settings_background_jobs_url, params: { job_name: 'start_photoprism_import' }
+
+            expect(response).to redirect_to(imports_url)
+          end
+        end
+
+        context 'when user is an admin' do
+          before { sign_in create(:user, :admin) }
+
+          it 'redirects to root page' do
+            get settings_background_jobs_url
+
+            expect(response).to redirect_to(root_url)
+            expect(flash[:alert]).to eq('You are not authorized to perform this action.')
+          end
+        end
+      end
+    end
+  end
+
+  describe 'GPS noise re-check notice' do
+    before { allow(DawarichSettings).to receive(:self_hosted?).and_return(true) }
+
+    let(:job) { DataMigrations::RecalculateAnomaliesUserJob }
+    let(:user) { create(:user) }
+
+    before { sign_in user }
+
+    it 'tells an account handed to a rebuild that a re-check is queued' do
+      user.update!(settings: user.settings.merge(job::QUEUED_SETTINGS_KEY => Time.current.iso8601))
+
+      get settings_background_jobs_url
+
+      expect(response.body).to include('queued for a one-time re-check')
+    end
+
+    it 'says nothing once the rebuild has stamped the account' do
+      user.update!(
+        settings: user.settings.merge(
+          job::QUEUED_SETTINGS_KEY => Time.current.iso8601,
+          job::RECALCULATED_SETTINGS_KEY => Time.current.iso8601
+        )
+      )
+
+      get settings_background_jobs_url
+
+      expect(response.body).not_to include('queued for a one-time re-check')
+    end
+
+    it 'says nothing to an account the dispatcher never handed out' do
+      create(:point, user: user)
+
+      get settings_background_jobs_url
+
+      expect(response.body).not_to include('queued for a one-time re-check')
+    end
+  end
+end

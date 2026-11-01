@@ -1,0 +1,46 @@
+<% content_for :title, t('.confirm_account_linking') %>
+
+<div class="min-h-content w-full my-5">
+  <div class="max-w-lg mx-auto">
+    <div class="card bg-base-200 shadow-xl">
+      <div class="card-body">
+        <h2 class="card-title"><%= t('.link_provider_to_your_dawarich_account', provider: @provider_label) %></h2>
+
+        <p class="text-sm text-base-content/70 mt-2">
+          <%= t('.existing_account_link_instructions_html', email: tag.strong(@user_email), provider: @provider_label) %>
+        </p>
+
+        <% if flash[:alert].present? %>
+          <div class="alert alert-error mt-4">
+            <%= flash[:alert] %>
+          </div>
+        <% end %>
+
+        <%= form_with url: confirm_auth_account_link_path, method: :post, data: { turbo: false }, class: "space-y-4 mt-4" do |f| %>
+          <div class="form-control">
+            <%= f.label :password, class: 'label' do %>
+              <span class="label-text"><%= t('.current_password') %></span>
+            <% end %>
+            <%= f.password_field :password, class: 'input input-bordered w-full', required: true, autocomplete: 'current-password', autofocus: true %>
+          </div>
+          <div class="form-control">
+            <%= f.submit t('.link_provider_and_sign_in', provider: @provider_label), class: 'btn btn-primary w-full' %>
+          </div>
+        <% end %>
+
+        <div class="divider"><%= t('.or') %></div>
+
+        <%= form_with url: email_fallback_auth_account_link_path, method: :post, data: { turbo: false } do %>
+          <%= submit_tag t('.email_me_a_confirmation_link_instead'), class: 'btn btn-ghost w-full' %>
+        <% end %>
+
+        <p class="text-xs text-base-content/50 mt-4">
+          <%= t('.forgot_your_password') %>
+          <%= link_to t('.reset_it'), new_user_password_path, class: 'link' %>
+          <%= t('.or') %>
+          <%= link_to t('.go_back_to_sign_in'), new_user_session_path, class: 'link' %>.
+        </p>
+      </div>
+    </div>
+  </div>
+</div>

@@ -1,0 +1,325 @@
+import { Controller } from "@hotwired/stimulus"
+import { translate } from "i18n"
+import { createMapChannel } from "maps_maplibre/channels/map_channel"
+import { Toast } from "maps_maplibre/components/toast"
+import { pointMatchesActiveDateRange } from "maps_maplibre/utils/realtime_date_filter"
+import { SettingsManager } from "maps_maplibre/utils/settings_manager"
+
+const LIVE_REFRESH_DELAY_MS = 1000
+
+/**
+ * Real-time controller
+ * Manages ActionCable connection and real-time updates
+ */
+export default class extends Controller {
+  static targets = ["liveModeToggle"]
+
+  static values = {
+    enabled: { type: Boolean, default: true },
+    liveMode: { type: Boolean, default: false },
+  }
+
+  connect() {
+    if (!this.enabledValue) {
+      return
+    }
+
+    try {
+      this.connectedChannels = new Set()
+      this.liveModeEnabled = this.liveModeValue
+
+      setTimeout(() => {
+        try {
+          this.setupChannels()
+        } catch (error) {
+          console.error(
+            "[Realtime Controller] Failed to setup channels in setTimeout:",
+            error,
+          )
+          this.updateConnectionIndicator(false)
+        }
+      }, 1000)
+
+      if (this.hasLiveModeToggleTarget) {
+        this.liveModeToggleTarget.checked = this.liveModeEnabled
+      }
+    } catch (error) {
+      console.error("[Realtime Controller] Failed to initialize:", error)
+    }
+  }
+
+  disconnect() {
+    clearTimeout(this.liveRefreshTimer)
+    this.liveRefreshTimer = null
+    this.channels?.unsubscribeAll()
+  }
+
+  /**
+   * Setup ActionCable channels
+   * Family channel is always enabled when family feature is on
+   * Points channel (live mode) is controlled by user toggle
+   */
+  setupChannels() {
+    try {
+      this.channels = createMapChannel({
+        connected: this.handleConnected.bind(this),
+        disconnected: this.handleDisconnected.bind(this),
+        received: this.handleReceived.bind(this),
+        enableLiveMode: this.liveModeEnabled,
+      })
+    } catch (error) {
+      console.error("[Realtime Controller] Failed to setup channels:", error)
+      console.error("[Realtime Controller] Error stack:", error.stack)
+      this.updateConnectionIndicator(false)
+    }
+  }
+
+  /**
+   * Toggle live mode (new points appearing in real-time)
+   */
+  toggleLiveMode(event) {
+    this.liveModeEnabled = event.target.checked
+
+    if (this.channels) {
+      this.channels.unsubscribeAll()
+    }
+    this.setupChannels()
+
+    SettingsManager.updateSetting("liveMapEnabled", this.liveModeEnabled)
+
+    const message = this.liveModeEnabled
+      ? translate("live_map.enabled")
+      : translate("live_map.disabled")
+    Toast.info(message)
+  }
+
+  /**
+   * Handle connection
+   */
+  handleConnected(channelName) {
+    this.connectedChannels.add(channelName)
+
+    if (this.connectedChannels.size === 1) {
+      Toast.success(translate("messages.connected_to_real_time_updates"))
+      this.updateConnectionIndicator(true)
+    }
+  }
+
+  /**
+   * Handle disconnection
+   */
+  handleDisconnected(channelName) {
+    this.connectedChannels.delete(channelName)
+
+    if (this.connectedChannels.size === 0) {
+      Toast.warning(translate("messages.disconnected_from_real_time_updates"))
+      this.updateConnectionIndicator(false)
+    }
+  }
+
+  /**
+   * Handle received data
+   */
+  handleReceived(data) {
+    switch (data.type) {
+      case "new_point":
+        this.handleNewPoint(data.point)
+        break
+
+      case "family_location":
+        this.handleFamilyLocation(data.member)
+        break
+
+      case "map_edit":
+        this.handleMapEdit(data.event)
+        break
+
+      case "track_update":
+        this.handleTrackUpdate(data)
+        break
+
+      // Note: notifications are handled by notifications_controller.js in the navbar
+    }
+  }
+
+  handleMapEdit(event) {
+    if (event?.type !== "point_moved" || !event.data) return
+    const mapsController = this.mapsV2Controller
+    if (!mapsController) return
+
+    mapsController.mapDataManager?.invalidatePoints()
+    const editor = mapsController.layerManager?.getLayer("map-editor")
+    editor?.applyRealtime(event.data)
+    mapsController.layerManager?.getLayer("points-mvt")?.refresh()
+    mapsController.layerManager?.getLayer("tracks-mvt")?.refresh()
+    editor?.reapplyTileFilters()
+    document.dispatchEvent(
+      new CustomEvent("dawarich:point-moved", { detail: event.data }),
+    )
+  }
+
+  handleTrackUpdate() {
+    const mapsController = this.mapsV2Controller
+    if (!mapsController) return
+
+    mapsController.rangeStatistics?.refresh()
+
+    mapsController.layerManager?.getLayer("tracks-mvt")?.refresh()
+    mapsController.layerManager?.getLayer("map-editor")?.reapplyTileFilters()
+  }
+
+  /**
+   * Get the maps--maplibre controller (on same element)
+   */
+  get mapsV2Controller() {
+    const element = this.element
+    const app = this.application
+    return app.getControllerForElementAndIdentifier(element, "maps--maplibre")
+  }
+
+  /**
+   * Handle new point
+   * Point data is broadcast as: [lat, lon, battery, altitude, timestamp, velocity, id, country_name]
+   */
+  handleNewPoint(pointData) {
+    const mapsController = this.mapsV2Controller
+    if (!mapsController) {
+      console.warn("[Realtime Controller] Maps controller not found")
+      return
+    }
+
+    const [lat, lon, battery, altitude, timestamp, velocity, id, countryName] =
+      pointData
+
+    this.updateRecentPoint(parseFloat(lon), parseFloat(lat), {
+      id: parseInt(id, 10),
+      battery: parseFloat(battery) || null,
+      altitude: parseFloat(altitude) || null,
+      timestamp: timestamp,
+      velocity: parseFloat(velocity) || null,
+      country_name: countryName || null,
+    })
+
+    if (
+      !pointMatchesActiveDateRange(
+        timestamp,
+        mapsController.realtimeDateRange(),
+      )
+    ) {
+      return
+    }
+
+    mapsController.mapDataManager?.invalidatePoints({ appendOnly: true })
+    this.scheduleLiveRefresh()
+
+    this.zoomToPoint(parseFloat(lon), parseFloat(lat))
+
+    Toast.info(translate("messages.new_location_recorded"))
+  }
+
+  scheduleLiveRefresh() {
+    if (this.liveRefreshTimer) return
+
+    this.liveRefreshTimer = setTimeout(() => {
+      this.liveRefreshTimer = null
+      this.refreshLiveLayers()
+    }, LIVE_REFRESH_DELAY_MS)
+  }
+
+  refreshLiveLayers() {
+    const mapsController = this.mapsV2Controller
+    if (!mapsController) return
+
+    mapsController.layerManager?.getLayer("points-mvt")?.refresh()
+    mapsController.layerManager?.getLayer("map-editor")?.reapplyTileFilters()
+    mapsController.layerManager
+      ?.getLayer("scratch")
+      ?.update()
+      .catch((error) => {
+        console.warn(
+          "[Realtime Controller] Failed to refresh visited countries:",
+          error,
+        )
+        Toast.retry(
+          translate("messages.failed_to_load_visited_countries"),
+          translate("messages.retry"),
+          () => mapsController.layerManager?.getLayer("scratch")?.update(),
+        )
+      })
+  }
+
+  /**
+   * Handle family member location update
+   */
+  handleFamilyLocation(member) {
+    const mapsController = this.mapsV2Controller
+    if (!mapsController) return
+
+    const familyLayer = mapsController.layerManager?.getLayer("family")
+    if (familyLayer) {
+      familyLayer.updateMember(member)
+    }
+  }
+
+  // Note: Notifications are handled by notifications_controller.js in the navbar
+
+  /**
+   * Update the recent point marker
+   * The marker shows the user's current position, independent of points layer visibility
+   */
+  updateRecentPoint(longitude, latitude, properties = {}) {
+    const mapsController = this.mapsV2Controller
+    if (!mapsController) {
+      console.warn("[Realtime Controller] Maps controller not found")
+      return
+    }
+
+    if (
+      Number(properties.timestamp) <
+      Number(mapsController.currentPositionValue?.timestamp)
+    ) {
+      return
+    }
+
+    mapsController.currentPositionValue = {
+      longitude,
+      latitude,
+      timestamp: properties.timestamp,
+    }
+
+    const recentPointLayer =
+      mapsController.layerManager?.getLayer("recentPoint")
+    if (!recentPointLayer) {
+      console.warn("[Realtime Controller] Recent point layer not found")
+      return
+    }
+
+    recentPointLayer.show()
+    recentPointLayer.updateRecentPoint(longitude, latitude, properties)
+  }
+
+  /**
+   * Zoom map to a specific point
+   */
+  zoomToPoint(longitude, latitude) {
+    const mapsController = this.mapsV2Controller
+    if (!mapsController || !mapsController.map) {
+      console.warn("[Realtime Controller] Map not available for zooming")
+      return
+    }
+
+    const map = mapsController.map
+
+    map.flyTo({
+      center: [longitude, latitude],
+      zoom: Math.max(map.getZoom(), 14),
+      duration: 2000,
+      essential: true,
+    })
+  }
+
+  /**
+   * Update connection indicator (no-op, badge removed)
+   */
+  updateConnectionIndicator(_connected) {}
+}

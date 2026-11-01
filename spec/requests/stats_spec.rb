@@ -1,0 +1,163 @@
+# frozen_string_literal: true
+
+require 'rails_helper'
+
+RSpec.describe '/stats', type: :request do
+  context 'when user is not signed in' do
+    describe 'GET /index' do
+      it 'redirects to the sign in page' do
+        get stats_url
+
+        expect(response.status).to eq(302)
+      end
+    end
+
+    describe 'GET /show' do
+      it 'redirects to the sign in page' do
+        get stats_url(2024)
+
+        expect(response.status).to eq(401)
+      end
+    end
+  end
+
+  context 'when user is signed in' do
+    let(:user) { create(:user) }
+
+    before { sign_in user }
+
+    describe 'GET /index' do
+      it 'redirects to the all-time insights' do
+        get stats_url
+
+        expect(response).to redirect_to(insights_path(year: 'all'))
+      end
+
+      context 'with a stat to show' do
+        before do
+          create(:stat, user:, year: 2024)
+        end
+
+        it 'renders the geocoding stats when the instance has a geocoding provider' do
+          configure_instance_geocoding
+
+          get insights_path(year: 'all')
+
+          expect(response.status).to eq(200)
+          expect(response.body).to include(I18n.t('stats.reverse_geocoding_stats.reverse_geocoded_points'))
+        end
+
+        it 'renders without the geocoding stats when no geocoding provider is configured' do
+          get insights_path(year: 'all')
+
+          expect(response.status).to eq(200)
+          expect(response.body).not_to include(I18n.t('stats.reverse_geocoding_stats.reverse_geocoded_points'))
+        end
+      end
+    end
+
+    describe 'GET /show' do
+      let(:stat) { create(:stat, user:, year: 2024) }
+
+      it 'redirects to that year in insights' do
+        get "/stats/#{stat.year}"
+
+        expect(response).to redirect_to(insights_path(year: stat.year))
+      end
+    end
+
+    describe 'GET /month' do
+      before { create(:stat, user:, year: 2024, month: 6) }
+
+      it 'tells a user with privacy zones that the shared month keeps them hidden' do
+        tag = create(:tag, user:, privacy_radius_meters: 300)
+        tag.places << create(:place, user:, latitude: 52.5, longitude: 13.4)
+
+        get month_stats_path(year: 2024, month: 6)
+
+        expect(response.body).to include('data-testid="share-privacy-zones-note"')
+      end
+
+      it 'leaves the privacy zone note out for a user without privacy zones' do
+        get month_stats_path(year: 2024, month: 6)
+
+        expect(response).to have_http_status(:ok)
+        expect(response.body).not_to include('data-testid="share-privacy-zones-note"')
+      end
+    end
+
+    describe 'POST /update' do
+      let(:stat) { create(:stat, user:, year: 2024) }
+
+      context 'when updating a specific month' do
+        it 'enqueues Stats::CalculatingJob for the given year and month' do
+          put update_year_month_stats_url(year: '2024', month: '1')
+
+          expect(Stats::CalculatingJob).to have_been_enqueued.with(user.id, '2024', '1')
+        end
+
+        it 'rejects zero and out-of-range months without enqueueing work' do
+          %w[0 00 13 99].each do |month|
+            expect do
+              put update_year_month_stats_url(year: '2024', month:)
+            end.not_to have_enqueued_job(Stats::CalculatingJob)
+
+            expect(response).to redirect_to(insights_path)
+            expect(response).to have_http_status(:see_other)
+            expect(flash[:alert]).to eq('Select a valid month before updating statistics')
+          end
+        end
+      end
+
+      context 'when updating the whole year' do
+        it 'enqueues Stats::CalculatingJob for each month of the year' do
+          put update_year_month_stats_url(year: '2024', month: 'all')
+
+          (1..12).each do |month|
+            expect(Stats::CalculatingJob).to have_been_enqueued.with(user.id, '2024', month)
+          end
+        end
+      end
+
+      context 'when user is inactive' do
+        before do
+          user.update(status: :inactive, active_until: 1.day.ago)
+        end
+
+        it 'returns an unauthorized response' do
+          put update_year_month_stats_url(year: '2024', month: '1')
+
+          expect(response).to redirect_to(root_path)
+          expect(flash[:notice]).to eq('Your account is not active.')
+        end
+      end
+    end
+
+    describe 'PUT /update_all' do
+      let(:stat) { create(:stat, user:, year: 2024) }
+
+      it 'enqueues Stats::CalculatingJob for each tracked year and month' do
+        allow(user).to receive(:years_tracked).and_return([{ year: 2024, months: %w[Jan Feb] }])
+
+        put update_all_stats_url
+
+        expect(Stats::CalculatingJob).to have_been_enqueued.with(user.id, 2024, 1)
+        expect(Stats::CalculatingJob).to have_been_enqueued.with(user.id, 2024, 2)
+        expect(Stats::CalculatingJob).to_not have_been_enqueued.with(user.id, 2024, 3)
+      end
+
+      context 'when user is inactive' do
+        before do
+          user.update(status: :inactive, active_until: 1.day.ago)
+        end
+
+        it 'returns an unauthorized response' do
+          put update_all_stats_url
+
+          expect(response).to redirect_to(root_path)
+          expect(flash[:notice]).to eq('Your account is not active.')
+        end
+      end
+    end
+  end
+end

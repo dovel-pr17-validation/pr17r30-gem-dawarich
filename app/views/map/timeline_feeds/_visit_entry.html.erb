@@ -1,0 +1,113 @@
+<% times = visit_entry_times(entry); all_day = visit_entry_all_day?(entry) %>
+<% coords = [entry[:place], entry[:area], entry[:suggested_places]&.first, entry[:center]].compact.find { |c| c[:lat] && c[:lng] } %>
+<% name_parts = visit_entry_name_parts(entry) %>
+<%# A visit renders the same regardless of detection status — showing it is
+    asserting it. The only affordance is Edit: rename, re-attach a place,
+    or delete. data-status stays for API/JS compatibility. %>
+<li class="visit-row<%= ' visit-row--all-day' if all_day %><%= ' visit-row--subdued' if visit_entry_subdued?(entry) %><%= ' visit-row--lowconf' if visit_entry_low_confidence?(entry) %>"
+    id="visit_entry_<%= entry[:visit_id] %>"
+    data-visit-id="<%= entry[:visit_id] %>"
+    data-status="<%= visit_entry_status(entry) %>"
+    data-confidence-band="<%= entry[:confidence_band] %>"
+    data-testid="visit-row"
+    tabindex="0"
+    role="button"
+    aria-label="<%= visit_entry_display_name(entry) %> · <%= times[:start_label] %>"
+    data-action="click->timeline-feed#selectVisit keydown.enter->timeline-feed#selectVisit keydown.space->timeline-feed#selectVisit mouseenter->timeline-feed#entryHover mouseleave->timeline-feed#entryUnhover"
+    data-entry-type="visit"
+    data-started-at="<%= entry[:started_at] %>"
+    data-ended-at="<%= entry[:ended_at] %>"
+    data-search-tokens="<%= visit_entry_search_tokens(entry) %>"
+    data-controller="visit-editor<%= ' visit-place-search' if coords %>"
+    <% if coords %>
+      data-visit-lat="<%= coords[:lat] %>"
+      data-visit-lng="<%= coords[:lng] %>"
+      data-visit-place-search-visit-id-value="<%= entry[:visit_id] %>"
+      data-visit-place-search-lat-value="<%= coords[:lat] %>"
+      data-visit-place-search-lng-value="<%= coords[:lng] %>"
+      data-visit-place-search-api-key-value="<%= current_user.api_key %>"
+    <% end %>>
+  <span class="visit-row__check">
+    <input type="checkbox"
+           data-timeline-feed-target="rowCheck"
+           data-visit-id="<%= entry[:visit_id] %>"
+           data-action="change->timeline-feed#rowCheckChanged click->timeline-feed#stopPropagation"
+           aria-label="<%= t('.select_visit_for_merge') %>"
+           tabindex="-1">
+  </span>
+
+  <%# Arrival time only. The end time is the start plus the duration printed
+      on the right, and stacking both turned the column into a grey block. %>
+  <div class="visit-row__time">
+    <% if all_day %>
+      <span class="visit-row__all-day"><%= t('.all_day') %></span>
+    <% else %>
+      <%= times[:start_label] %>
+    <% end %>
+  </div>
+
+  <div class="visit-row__rail">
+    <span class="visit-status-dot"></span>
+  </div>
+
+  <div class="visit-row__content">
+    <div class="visit-row__title">
+      <span data-testid="visit-name-<%= entry[:visit_id] %>"><%= name_parts[:primary] %></span>
+    </div>
+    <div class="visit-row__meta">
+      <% if name_parts[:secondary] %>
+        <span class="visit-row__address"><%= name_parts[:secondary] %></span>
+      <% end %>
+      <span class="visit-row__points"><%= entry[:point_count] %> <%= t('.pts') %></span>
+      <% Array(entry[:tags]).each do |t| %>
+        <span class="visit-tag">
+          <span class="visit-tag__dot" style="background-color: <%= t[:color] %>;"></span>#<%= t[:name] %>
+        </span>
+      <% end %>
+    </div>
+  </div>
+
+  <div class="visit-row__actions">
+    <button type="button"
+            class="visit-edit-btn"
+            data-testid="visit-edit"
+            data-visit-editor-target="button"
+            aria-expanded="false"
+            title="<%= t('.edit') %>"
+            data-action="click->visit-editor#toggle">
+      <%= icon 'square-pen', class: 'w-3 h-3' %>
+      <span class="sr-only"><%= t('.edit') %></span>
+    </button>
+    <% unless all_day %>
+      <span class="visit-row__duration"><%= format_dwell_minutes(visit_entry_duration(entry)) %></span>
+    <% end %>
+  </div>
+
+  <div class="visit-row__editor hidden"
+       data-visit-editor-target="panel"
+       data-action="click->timeline-feed#stopPropagation keydown->timeline-feed#stopPropagation">
+    <label class="visit-editor__label" for="visit-editor-name-<%= entry[:visit_id] %>"><%= t('.name') %></label>
+    <%= form_with url: visit_path(entry[:visit_id]), scope: :visit, method: :patch,
+                  class: 'visit-editor__name-form' do |f| %>
+      <%= hidden_field_tag :date, times[:start_at].to_date, id: nil if entry[:continuation_of_date] %>
+      <%= f.text_field :name, value: entry[:editable_name], placeholder: visit_entry_display_name(entry),
+                       id: "visit-editor-name-#{entry[:visit_id]}",
+                       class: 'input input-xs input-bordered flex-1 min-w-0',
+                       data: { testid: 'visit-editor-name' } %>
+      <%= f.submit t('.save'), class: 'btn btn-xs btn-primary', data: { testid: 'visit-editor-save' } %>
+    <% end %>
+
+    <% if coords %>
+      <label class="visit-editor__label"><%= t('.attached_place') %></label>
+      <div class="visit-row__place-search" data-visit-place-search-target="mount"></div>
+    <% end %>
+
+    <div class="visit-editor__foot">
+      <%= button_to t('.delete'), visit_path(entry[:visit_id]),
+                    method: :delete,
+                    params: entry[:continuation_of_date] ? { date: times[:start_at].to_date } : {},
+                    data: { testid: 'visit-delete', turbo_confirm: t('.delete_this_visit_your_location_points_stay') },
+                    class: 'btn btn-xs btn-ghost text-error' %>
+    </div>
+  </div>
+</li>
